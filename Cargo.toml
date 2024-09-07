@@ -12,6 +12,7 @@ members = [
     "xtask",
     "tests",
     "testthing",
+    "scripts/rust",
 ]
 resolver = "2"
 

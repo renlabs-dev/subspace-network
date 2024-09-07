@@ -1,0 +1,33 @@
+[package]
+name = "snapshot_generator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1.0.120"
+structopt = "0.3.26"
+codec = { package = "parity-scale-codec", version = "3.6.1", features = [
+    "derive",
+] }
+tokio = { version = "1.38.0", features = ["full"] }
+
+# Substrate dependencies
+substrate-api-client = { git = "https://github.com/scs/substrate-api-client.git", branch = "master", features = [
+    "ws-client",
+] }
+sp-core = { git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v1.0.0" }
+frame-support = { git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v1.0.0" }
+frame-system = { git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v1.0.0" }
+sp-runtime = { git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v1.0.0" }
+sp-std = { git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v1.0.0" }
+hex = "0.4.3"
+
+[features]
+default = ["std"]
+std = [
+    "frame-support/std",
+    "frame-system/std",
+    "sp-runtime/std",
+    "sp-std/std",
+    "sp-core/std",
+]

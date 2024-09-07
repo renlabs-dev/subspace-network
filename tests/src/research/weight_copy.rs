@@ -7,26 +7,16 @@ use pallet_subnet_emission::{
 };
 use pallet_subnet_emission_api::SubnetConsensus;
 use pallet_subspace::{
-    BondsMovingAverage, LastUpdate, MaxAllowedUids, MaxAllowedWeights, MaxEncryptionPeriod,
-    MaxRegistrationsPerBlock, MaxWeightAge, RegistrationBlock, Tempo, UseWeightsEncrytyption,
-    ValidatorPermits, Weights, N,
+    BondsMovingAverage, CopyingAllowedProfitMargin, FounderShare, LastUpdate, MaxAllowedUids,
+    MaxAllowedWeights, MaxEncryptionPeriod, MaxRegistrationsPerBlock, MaxWeightAge,
+    RegistrationBlock, Tempo, UseWeightsEncrytyption, ValidatorPermits, Weights, N,
 };
 use serde_json::Value;
 use sp_runtime::Percent;
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{cmp::Ordering, fs::File, io::Read, path::PathBuf};
 
-// TODO:
-// ## BUILDUP
-// Build subnet modules according to the data
-
-// ## Get random 10 epoch information
-// - Download weight information
-// - Download registration information
-
-/// Super simple test ensuring it is not profitable to copy weights
-
-// TODO:
-// thing bonds
+// todo: look at the passing of copier stake
+// dbg copier and avg delta
 #[test]
 fn test_backtest_simulation() {
     new_test_ext().execute_with(|| {
@@ -34,10 +24,10 @@ fn test_backtest_simulation() {
         const TEST_NETUID: u16 = 0;
         const TEMPO: u64 = 360;
         const UNIVERSAL_PENDING_EMISSION: u64 = to_nano(100);
-        const DELEGATION_FEE: Percent = Percent::from_percent(3);
+        const DELEGATION_FEE: Percent = Percent::from_percent(9);
         // BACKTEST SETTINGS
         const MAX_EPOCHS: usize = 50;
-        const JSON_NETUID: &str = "19"; // ! dont forget to change
+        const JSON_NETUID: &str = "12"; // ! dont forget to change
 
         // REGISTER AND SETUP SUBNET
         setup_subnet(TEST_NETUID, TEMPO);
@@ -53,6 +43,8 @@ fn test_backtest_simulation() {
         System::set_block_number(first_block);
         // Overwrite last update and registration blocks
         make_parameter_consensus_overwrites(TEST_NETUID, first_block, &json, None);
+
+        // CopyingAllowedProfitMargin::<Test>::set(TEST_NETUID, Percent::from_percent(9));
 
         // copier will set perfectly in consensus weight
         let copier_uid = setup_copier(
@@ -89,14 +81,15 @@ fn setup_subnet(netuid: u16, tempo: u64) {
     SubnetConsensusType::<Test>::set(netuid, Some(SubnetConsensus::Yuma));
     Tempo::<Test>::insert(netuid, tempo as u16);
     BondsMovingAverage::<Test>::insert(netuid, 0);
-    UseWeightsEncrytyption::<Test>::set(netuid, false);
+    UseWeightsEncrytyption::<Test>::set(netuid, true);
 
     // Things that should never expire / exceed
-    MaxWeightAge::<Test>::set(netuid, u64::MAX);
+    MaxWeightAge::<Test>::set(netuid, 28_000);
     MaxEncryptionPeriod::<Test>::set(netuid, u64::MAX);
     MaxRegistrationsPerBlock::<Test>::set(u16::MAX);
     MaxAllowedUids::<Test>::set(netuid, u16::MAX);
     MaxAllowedWeights::<Test>::set(netuid, u16::MAX);
+    FounderShare::<Test>::set(netuid, 0);
 }
 
 fn setup_copier(
@@ -106,7 +99,6 @@ fn setup_copier(
     json_netuid: &str,
     universal_pending_emission: u64,
 ) -> u16 {
-    // Copier will be appended
     let copier_uid: u16 = N::<Test>::get(netuid);
 
     let v_permits = get_validator_permits(first_block, json);
@@ -141,15 +133,17 @@ fn run_simulation(
     json_netuid: &str,
     tempo: u64,
     delegation_fee: Percent,
-    max_epochs: usize,
+    _max_epochs: usize,
     universal_pending_emission: u64,
 ) -> (ConsensusSimulationResult<Test>, usize) {
     let mut simulation_result = ConsensusSimulationResult::default();
     let mut iter_counter = 0;
 
-    let copier_last_update = SubspaceMod::get_last_update_for_uid(netuid, copier_uid);
+    let mut copier_last_update = SubspaceMod::get_last_update_for_uid(netuid, copier_uid);
 
     let mut csv_data = Vec::new();
+    let mut current_window_data: Vec<f64> = Vec::new();
+    let mut encryption_window = 0;
 
     for (block_number, block_weights) in json["weights"].as_object().unwrap() {
         let block_number: u64 = block_number.parse().unwrap();
@@ -163,7 +157,6 @@ fn run_simulation(
         let weights: &Value = &block_weights[json_netuid];
 
         let mut v_permits = get_validator_permits(block_number, json);
-        // add permit for the copier
         v_permits.push(true);
 
         insert_weights_for_block(weights, netuid, v_permits);
@@ -173,76 +166,108 @@ fn run_simulation(
         last_output.clone().apply();
         simulation_result.update(last_output.clone(), tempo, copier_uid, delegation_fee);
 
-        csv_data.push((
-            block_number,
-            last_output.consensus,
-            last_output.dividends.clone(),
-            last_output.dividends[copier_uid as usize],
-            simulation_result.cumulative_copier_divs,
-            simulation_result.cumulative_avg_delegate_divs,
-        ));
+        // Calculate the percent difference between Dc(e) and Dd(e) for this epoch
+        let dc = simulation_result.cumulative_copier_divs.to_num::<f64>();
+        let dd = simulation_result.cumulative_avg_delegate_divs.to_num::<f64>();
+        let diff = (dc - dd).abs();
+
+        current_window_data.push(diff);
 
         if pallet_offworker::is_copying_irrational(simulation_result.clone()) {
             println!("Copying became irrational at block {}", block_number);
-            break;
-        }
+            encryption_window += 1;
 
-        step_block(1);
+            let black_box_age = simulation_result.black_box_age / tempo;
+            let gini = calculate_gini(&current_window_data);
+            csv_data.push((block_number, dc, dd, gini, encryption_window, black_box_age));
+            current_window_data.clear();
+
+            // Setup copier for next window
+            let mut values = last_output.consensus;
+            // fitler last weight
+            values.pop();
+
+            // setup copier
+            let copier_acc = SubspaceMod::get_key_for_uid(netuid, copier_uid).unwrap();
+            let copier_stake = get_copier_stake(netuid);
+            make_keys_all_stake_be(copier_acc, copier_stake);
+
+            let uids: Vec<u16> = (0..values.len() as u16).collect();
+            let zipped_weights: Vec<(u16, u16)> = uids.iter().copied().zip(values).collect();
+
+            let copy_l_u = block_number - 100;
+            // update copiers last update
+            let latest_last_update = LastUpdate::<Test>::get(netuid);
+            let mut last_update_vec = latest_last_update.clone();
+            last_update_vec.push(copy_l_u);
+            LastUpdate::<Test>::set(netuid, last_update_vec);
+            copier_last_update = copy_l_u;
+
+            Weights::<Test>::insert(netuid, copier_uid, zipped_weights);
+
+            // Reset the simulation result
+            simulation_result = ConsensusSimulationResult::default();
+            dbg!(iter_counter);
+        }
         iter_counter += 1;
-
-        if iter_counter >= max_epochs {
-            println!(
-                "Max iterations ({}) reached without copying becoming irrational",
-                max_epochs
-            );
-            break;
-        }
     }
 
-    let mut wtr = match csv::Writer::from_path("simulation_results.csv") {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("Error creating CSV writer: {}", e);
-            return (simulation_result, iter_counter);
-        }
-    };
+    // Write to CSV
+    let mut wtr =
+        csv::Writer::from_path("simulation_results.csv").expect("Failed to create CSV writer");
 
-    if let Err(e) = wtr.write_record(&[
+    wtr.write_record(&[
         "Block Number",
-        "Consensus",
-        "All Dividends",
-        "Copier Dividend",
         "Cumulative Copier Dividends",
         "Cumulative Average Delegate Dividends",
-    ]) {
-        eprintln!("Error writing CSV header: {}", e);
-        return (simulation_result, iter_counter);
-    }
+        "Gini Coefficient",
+        "Encryption Window",
+        "Black Box Age",
+    ])
+    .expect("Failed to write CSV header");
 
-    // Write the data
     for row in csv_data {
-        if let Err(e) = wtr.write_record(&[
+        wtr.write_record(&[
             row.0.to_string(),
             format!("{:?}", row.1),
             format!("{:?}", row.2),
-            row.3.to_string(),
+            format!("{:.4}", row.3),
             row.4.to_string(),
             row.5.to_string(),
-        ]) {
-            eprintln!("Error writing CSV row: {}", e);
-            return (simulation_result, iter_counter);
-        }
+        ])
+        .expect("Failed to write CSV row");
     }
 
-    if let Err(e) = wtr.flush() {
-        eprintln!("Error flushing CSV writer: {}", e);
-    }
+    wtr.flush().expect("Failed to flush CSV writer");
 
     (simulation_result, iter_counter)
 }
+
+fn calculate_gini(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+
+    if mean == 0.0 {
+        return 0.0;
+    }
+
+    let mut sum_of_abs_differences = 0.0;
+
+    for &value in values {
+        for &other_value in values {
+            sum_of_abs_differences += (value - other_value).abs();
+        }
+    }
+
+    sum_of_abs_differences / (2.0 * n * n * mean)
+}
 fn load_json_data() -> Value {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("../snapshots/sn19_weights_stake.json");
+    path.push("../snapshots/sn12_weights_stake.json");
     let mut file = File::open(path).expect("Failed to open weights_stake.json");
     let mut contents = String::new();
     file.read_to_string(&mut contents).expect("Failed to read file");
@@ -338,152 +363,4 @@ fn make_parameter_consensus_overwrites(
     for (i, block) in registration_blocks_vec.iter().enumerate() {
         RegistrationBlock::<Test>::set(netuid, i as u16, *block);
     }
-}
-
-#[test]
-fn test_weight_copying_irrationality() {
-    new_test_ext().execute_with(|| {
-        // Parameters
-        const NETUID: u16 = 0;
-        const NUM_MODULES: u16 = 10;
-        const WEIGHT_VECTOR_LENGTH: usize = 4;
-        const COPIER_UID: u16 = 10;
-        const MAX_ITERATIONS: usize = 100;
-        const MODULE_STAKE: u64 = to_nano(10_000);
-        const UNIVERSAL_PENDING_EMISSION: u64 = to_nano(100);
-        const DELEGATION_FEE: Percent = Percent::from_percent(5);
-        const TEMPO: u64 = 360;
-
-        // Setup the subnet
-        register_subnet(u32::MAX, 0).unwrap();
-        SubnetConsensusType::<Test>::set(NETUID, Some(SubnetConsensus::Yuma));
-        MaxWeightAge::<Test>::insert(NETUID, 100_000);
-        Tempo::<Test>::insert(NETUID, TEMPO as u16);
-        UseWeightsEncrytyption::<Test>::set(NETUID, false);
-        MaxEncryptionPeriod::<Test>::set(NETUID, u64::MAX);
-
-        // Setup the network
-        zero_min_burn();
-        MaxRegistrationsPerBlock::<Test>::set(1000);
-
-        // Register 10 modules
-        register_n_modules(NETUID, NUM_MODULES, MODULE_STAKE, false);
-
-        step_block(1);
-        let mut consensus_weights = vec![1000u16; WEIGHT_VECTOR_LENGTH];
-        let uid_vector: Vec<u16> = (0..WEIGHT_VECTOR_LENGTH as u16).collect();
-
-        // Assert different vector size
-        assert_eq!(consensus_weights.len(), uid_vector.len());
-
-        // Set initial weights for miners
-        for key in 0..NUM_MODULES as u16 {
-            if !uid_vector.contains(&key) {
-                set_weights(
-                    NETUID,
-                    key as u32,
-                    uid_vector.clone(),
-                    consensus_weights.clone(),
-                );
-            }
-        }
-
-        // Add weight copier that the simulated consensus will use
-        add_weight_copier(
-            NETUID,
-            COPIER_UID as u32,
-            uid_vector.clone(),
-            consensus_weights.clone(),
-        );
-
-        // Initialize the value of default consensus simulation struct
-        let mut simulation_result: ConsensusSimulationResult<Test> =
-            ConsensusSimulationResult::default();
-
-        let mut csv_data = Vec::new();
-
-        for iteration in 0..MAX_ITERATIONS {
-            // Create parameters out of setup that was made before the loop
-            // After first iteration, this will be updated due to dynamically changing weights
-            let last_params = YumaParams::<Test>::new(NETUID, UNIVERSAL_PENDING_EMISSION).unwrap();
-            let last_output = YumaEpoch::<Test>::new(NETUID, last_params).run().unwrap();
-            last_output.clone().apply();
-
-            simulation_result.update(last_output.clone(), TEMPO, COPIER_UID, DELEGATION_FEE);
-
-            csv_data.push((
-                TEMPO * iteration as u64,
-                last_output.consensus,
-                last_output.dividends.clone(),
-                last_output.dividends[COPIER_UID as usize],
-                simulation_result.cumulative_copier_divs,
-                simulation_result.cumulative_avg_delegate_divs,
-            ));
-
-            let index_to_change = match iteration % 3 {
-                0 => 1, // Second weight
-                1 => 3, // Fourth weight
-                2 => 5, // Sixth weight
-                _ => unreachable!(),
-            };
-
-            if let Some(weight) = consensus_weights.get_mut(index_to_change) {
-                // Change by 10%
-                let change_factor = 1.1; // 10% increase
-                *weight = (*weight as f32 * change_factor).round() as u16;
-            }
-
-            for key in 0..NUM_MODULES as u16 {
-                if !uid_vector.contains(&key) && key != COPIER_UID {
-                    set_weights(
-                        NETUID,
-                        key as u32,
-                        uid_vector.clone(),
-                        consensus_weights.clone(),
-                    );
-                }
-            }
-
-            // Check if copying is irrational, if so, break the loop
-            if pallet_offworker::is_copying_irrational(simulation_result.clone()) {
-                println!(
-                    "Copying became irrational after {} iterations",
-                    iteration + 1
-                );
-                break;
-            }
-        }
-
-        let mut wtr =
-            csv::Writer::from_path("simulation_results.csv").expect("Failed to create CSV writer");
-
-        wtr.write_record(&[
-            "Block Number",
-            "Consensus",
-            "All Dividends",
-            "Copier Dividend",
-            "Cumulative Copier Dividends",
-            "Cumulative Average Delegate Dividends",
-        ])
-        .expect("Failed to write CSV header");
-
-        // Write the data
-        for row in csv_data {
-            wtr.write_record(&[
-                row.0.to_string(),
-                format!("{:?}", row.1),
-                format!("{:?}", row.2),
-                row.3.to_string(),
-                row.4.to_string(),
-                row.5.to_string(),
-            ])
-            .expect("Failed to write CSV row");
-        }
-
-        wtr.flush().expect("Failed to flush CSV writer");
-
-        // Final check outside the loop
-        let is_copy_ira = pallet_offworker::is_copying_irrational(simulation_result.clone());
-        assert!(is_copy_ira, "Copying should have become irrational");
-    });
 }

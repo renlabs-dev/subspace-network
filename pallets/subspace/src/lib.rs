@@ -41,7 +41,6 @@ pub mod math;
 pub mod module;
 mod registration;
 pub mod rpc;
-mod set_weights;
 mod staking;
 pub mod subnet;
 pub mod weights;
@@ -70,6 +69,7 @@ pub mod pallet {
     use sp_arithmetic::per_things::Percent;
     use sp_core::{ConstU16, ConstU64, ConstU8};
     pub use sp_std::{vec, vec::Vec};
+    use substrate_fixed::types::I64F64;
 
     const STORAGE_VERSION: StorageVersion = StorageVersion::new(13);
 
@@ -94,7 +94,7 @@ pub mod pallet {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
         /// Currency type that will be used to place deposits on modules.
-        type Currency: Currency<Self::AccountId> + Send + Sync;
+        type Currency: Currency<Self::AccountId, Balance = u64> + Send + Sync;
 
         /// The default number of modules that can be registered per interval.
         type DefaultMaxRegistrationsPerInterval: Get<u16>;
@@ -317,6 +317,34 @@ pub mod pallet {
     #[pallet::storage] // --- ITEM ( subnet_burn )
     pub type SubnetBurn<T: Config> = StorageValue<_, u64, ValueQuery, DefaultSubnetBurn<T>>;
 
+    // TODO: make these a subnet params
+    #[pallet::storage]
+    pub type MaxEncryptionPeriod<T: Config> =
+        StorageMap<_, Identity, u16, u64, ValueQuery, ConstU64<2_000>>;
+
+    #[pallet::type_value]
+    pub fn DefaultMinUnderperformanceThreshold() -> I64F64 {
+        I64F64::from_num(0)
+    }
+
+    /// Allowed percentage profit margin of rationality,
+    /// above full irrationality for the weight copying strategy.
+    #[pallet::storage]
+    pub type CopierMargin<T: Config> =
+        StorageMap<_, Identity, u16, I64F64, ValueQuery, DefaultMinUnderperformanceThreshold>;
+
+    #[pallet::storage]
+    pub type UseWeightsEncrytyption<T: Config> = StorageMap<_, Identity, u16, bool, ValueQuery>;
+
+    #[pallet::type_value]
+    pub fn DefaultAlphaValues<T: Config>() -> (u16, u16) {
+        (45875, 58982)
+    }
+
+    #[pallet::storage]
+    pub type AlphaValues<T: Config> =
+        StorageMap<_, Identity, u16, (u16, u16), ValueQuery, DefaultAlphaValues<T>>;
+
     // ---------------------------------
     // Subnet PARAMS
     // ---------------------------------
@@ -339,7 +367,6 @@ pub mod pallet {
                 max_allowed_weights: 420,
                 max_allowed_uids: 420,
                 max_weight_age: 3_600,
-                trust_ratio: GetDefault::get(),
                 founder_share: FloorFounderShare::<T>::get() as u16,
                 incentive_ratio: 50,
                 founder: DefaultKey::<T>::get(),
@@ -378,7 +405,6 @@ pub mod pallet {
         pub name: BoundedVec<u8, ConstU32<256>>,
         pub metadata: Option<BoundedVec<u8, ConstU32<120>>>,
         pub tempo: u16, // how many blocks to wait before rewarding models
-        pub trust_ratio: u16,
         pub maximum_set_weight_calls_per_epoch: u16,
         // consensus
         pub bonds_ma: u64,
@@ -405,9 +431,6 @@ pub mod pallet {
 
     #[pallet::storage] // --- MAP ( netuid ) --> min_allowed_weights
     pub type MaxAllowedWeights<T> = StorageMap<_, Identity, u16, u16, ValueQuery, ConstU16<420>>;
-
-    #[pallet::storage] // --- MAP ( netuid ) --> epoch
-    pub type TrustRatio<T> = StorageMap<_, Identity, u16, u16, ValueQuery>;
 
     #[pallet::storage] // --- MAP ( netuid ) --> epoch
     pub type Tempo<T> = StorageMap<_, Identity, u16, u16, ValueQuery, ConstU16<100>>;
@@ -486,10 +509,6 @@ pub mod pallet {
     #[pallet::storage] // --- DMAP ( netuid, uid ) --> block number that the module is registered
     pub type RegistrationBlock<T: Config> =
         StorageDoubleMap<_, Identity, u16, Identity, u16, u64, ValueQuery>;
-
-    #[pallet::storage] // --- DMAP ( netuid, uid ) --> (u64, weights)
-    pub type Weights<T: Config> =
-        StorageDoubleMap<_, Identity, u16, Identity, u16, Vec<(u16, u16)>, ValueQuery>;
 
     #[pallet::storage]
     pub type WeightSetAt<T: Config> = StorageDoubleMap<_, Identity, u16, Identity, u16, u64>;
@@ -775,11 +794,7 @@ pub mod pallet {
                     );
                     self::Pallet::<T>::append_module(netuid, &module.key, changeset)
                         .expect("genesis modules are valid");
-                    Weights::<T>::insert(
-                        netuid,
-                        module_uid,
-                        module.weights.clone().unwrap_or_default(),
-                    );
+                    T::set_weights(netuid, module_uid, module.weights.clone());
 
                     for (staker, stake) in module.stake_from.iter().flatten() {
                         Pallet::<T>::increase_stake(staker, &module.key, *stake);
@@ -808,17 +823,6 @@ pub mod pallet {
             // Clears the root net weights daily quota
             Self::clear_rootnet_daily_weight_calls(block_number);
 
-            Self::copy_delegated_weights(block_number);
-
-            for netuid in N::<T>::iter_keys() {
-                if Self::blocks_until_next_epoch(netuid, block_number) > 0 {
-                    continue;
-                }
-
-                // Clear weights for normal subnets
-                Self::clear_set_weight_rate_limiter(netuid);
-            }
-
             // TODO: fix latr
             Weight::default()
         }
@@ -839,21 +843,6 @@ pub mod pallet {
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        // ---------------------------------
-        // Consensus operations
-        // ---------------------------------
-
-        #[pallet::call_index(0)]
-        #[pallet::weight((T::WeightInfo::set_weights(), DispatchClass::Normal, Pays::No))]
-        pub fn set_weights(
-            origin: OriginFor<T>,
-            netuid: u16,
-            uids: Vec<u16>,
-            weights: Vec<u16>,
-        ) -> DispatchResult {
-            Self::do_set_weights(origin, netuid, uids, weights)
-        }
-
         // ---------------------------------
         // Stake operations
         // ---------------------------------
@@ -993,7 +982,6 @@ pub mod pallet {
             min_allowed_weights: u16,
             max_weight_age: u64,
             tempo: u16,
-            trust_ratio: u16,
             maximum_set_weight_calls_per_epoch: u16,
             vote_mode: VoteMode,
             bonds_ma: u64,
@@ -1012,7 +1000,6 @@ pub mod pallet {
                 max_weight_age,
                 name,
                 tempo,
-                trust_ratio,
                 maximum_set_weight_calls_per_epoch,
                 bonds_ma,
                 module_burn_config,
@@ -1027,15 +1014,6 @@ pub mod pallet {
 
             let changeset = SubnetChangeset::update(netuid, params)?;
             Self::do_update_subnet(origin, netuid, changeset)
-        }
-
-        #[pallet::call_index(11)]
-        #[pallet::weight((T::WeightInfo::delegate_rootnet_control(), DispatchClass::Normal, Pays::No))]
-        pub fn delegate_rootnet_control(
-            origin: OriginFor<T>,
-            target: T::AccountId,
-        ) -> DispatchResult {
-            Self::do_delegate_rootnet_control(origin, target)
         }
 
         #[pallet::call_index(12)]
@@ -1082,28 +1060,10 @@ impl<T: Config> Pallet<T> {
     pub fn get_delegated_stake(staked: &T::AccountId) -> u64 {
         StakeFrom::<T>::iter_prefix_values(staked).sum()
     }
-
-    // --- Returns the transaction priority for setting weights.
-    pub fn get_priority_set_weights(key: &T::AccountId, netuid: u16) -> u64 {
-        if let Some(uid) = Uids::<T>::get(netuid, key) {
-            let last_update = Self::get_last_update_for_uid(netuid, uid);
-            Self::get_current_block_number().saturating_add(last_update)
-        } else {
-            0
-        }
-    }
-    // --- Returns the transaction priority for setting weights.
-    pub fn get_priority_stake(key: &T::AccountId, netuid: u16) -> u64 {
-        if Uids::<T>::contains_key(netuid, key) {
-            return Self::get_delegated_stake(key);
-        }
-        0
-    }
 }
 
 #[derive(Debug, PartialEq, Default)]
 pub enum CallType {
-    SetWeights,
     AddStake,
     TransferStakeMultiple,
     TransferMultiple,
@@ -1152,11 +1112,6 @@ where
         current_block_number.saturating_add(balance)
     }
 
-    pub fn get_priority_set_weights(who: &T::AccountId, netuid: u16) -> u64 {
-        // Return the non vanilla priority for a set weights call.
-        Pallet::<T>::get_priority_set_weights(who, netuid)
-    }
-
     #[must_use]
     pub fn u64_to_balance(
         input: u64,
@@ -1192,24 +1147,14 @@ where
     fn validate(
         &self,
         who: &Self::AccountId,
-        call: &Self::Call,
+        _call: &Self::Call,
         _info: &DispatchInfoOf<Self::Call>,
         _len: usize,
     ) -> TransactionValidity {
-        match call.is_sub_type() {
-            Some(Call::set_weights { netuid, .. }) => {
-                let priority: u64 = Self::get_priority_set_weights(who, *netuid);
-                Ok(ValidTransaction {
-                    priority,
-                    longevity: 1,
-                    ..Default::default()
-                })
-            }
-            _ => Ok(ValidTransaction {
-                priority: Self::get_priority_vanilla(who),
-                ..Default::default()
-            }),
-        }
+        Ok(ValidTransaction {
+            priority: Self::get_priority_vanilla(who),
+            ..Default::default()
+        })
     }
 
     // NOTE: Add later when we put in a pre and post dispatch step.
@@ -1228,7 +1173,6 @@ where
             Some(Call::remove_stake_multiple { .. }) => Ok((CallType::RemoveStakeMultiple, 0, who)),
             Some(Call::transfer_stake { .. }) => Ok((CallType::TransferStake, 0, who)),
             Some(Call::transfer_multiple { .. }) => Ok((CallType::TransferMultiple, 0, who)),
-            Some(Call::set_weights { .. }) => Ok((CallType::SetWeights, 0, who)),
             Some(Call::register { .. }) => Ok((CallType::Register, 0, who)),
             Some(Call::update_module { .. }) => Ok((CallType::Update, 0, who)),
             _ => Ok((CallType::Other, 0, who)),
@@ -1244,9 +1188,6 @@ where
     ) -> Result<(), TransactionValidityError> {
         if let Some((call_type, _transaction_fee, _who)) = maybe_pre {
             match call_type {
-                CallType::SetWeights => {
-                    log::debug!("Not Implemented!");
-                }
                 CallType::AddStake => {
                     log::debug!("Not Implemented! Need to add potential transaction fees here.");
                 }

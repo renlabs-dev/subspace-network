@@ -1,29 +1,39 @@
 #![allow(non_camel_case_types)]
 
+use core::panic;
 use frame_support::{
     ensure, parameter_types,
     traits::{Currency, Everything, Get, Hooks},
     PalletId,
 };
-use frame_system as system;
+use frame_system::{
+    self as system,
+    offchain::{AppCrypto, CreateSignedTransaction, SigningTypes},
+};
 use pallet_governance::GlobalGovernanceConfig;
 use pallet_governance_api::*;
+use pallet_offworker::{crypto::Signature, Call as OffworkerCall, MeasuredStakeAmount};
 use pallet_subnet_emission_api::{SubnetConsensus, SubnetEmissionApi};
-use scale_info::prelude::collections::BTreeSet;
-use sp_core::{ConstU16, H256};
-use std::cell::RefCell;
-
 use pallet_subspace::{
-    subnet::SubnetChangeset, Address, DefaultKey, DefaultSubnetParams, Dividends, Emission,
-    Incentive, LastUpdate, MaxRegistrationsPerBlock, Name, SubnetBurn, SubnetParams, Tempo,
-    TotalStake, N,
+    subnet::SubnetChangeset, Active, Address, BurnConfig, DefaultKey, DefaultSubnetParams,
+    Dividends, Emission, Incentive, LastUpdate, MaxRegistrationsPerBlock, Name, StakeFrom, StakeTo,
+    SubnetBurn, SubnetBurnConfig, SubnetParams, Tempo, TotalStake, N,
 };
+use parity_scale_codec::{Decode, Encode};
+use rand::rngs::OsRng;
+use rsa::{traits::PublicKeyParts, Pkcs1v15Encrypt};
+use scale_info::{prelude::collections::BTreeSet, TypeInfo};
+use sp_core::{sr25519, ConstU16, H256};
 use sp_runtime::{
-    traits::{AccountIdConversion, BlakeTwo256, IdentityLookup},
-    BuildStorage, DispatchError, DispatchResult,
+    generic::UncheckedExtrinsic,
+    traits::{AccountIdConversion, BlakeTwo256, IdentifyAccount, IdentityLookup},
+    BuildStorage, DispatchError, DispatchResult, KeyTypeId,
 };
-
-type Block = frame_system::mocking::MockBlock<Test>;
+use std::{
+    cell::RefCell,
+    io::{Cursor, Read},
+    iter::Copied,
+};
 
 frame_support::construct_runtime!(
     pub enum Test {
@@ -32,8 +42,12 @@ frame_support::construct_runtime!(
         SubnetEmissionMod: pallet_subnet_emission,
         SubspaceMod: pallet_subspace,
         GovernanceMod: pallet_governance,
+        OffWorkerMod: pallet_offworker,
     }
 );
+
+pub type Block = frame_system::mocking::MockBlock<Test>;
+pub type AccountId = u32;
 
 #[allow(dead_code)]
 pub type BalanceCall = pallet_balances::Call<Test>;
@@ -45,8 +59,6 @@ parameter_types! {
     pub const BlockHashCount: u64 = 250;
     pub const SS58Prefix: u8 = 42;
 }
-
-pub type AccountId = u32;
 
 // Balance of an account.
 pub type Balance = u64;
@@ -253,6 +265,61 @@ impl SubnetEmissionApi for Test {
     ) {
         pallet_subnet_emission::SubnetConsensusType::<Test>::set(netuid, subnet_consensus)
     }
+
+    fn get_weights(netuid: u16, uid: u16) -> Option<Vec<(u16, u16)>> {
+        pallet_subnet_emission::Weights::<Test>::get(netuid, uid)
+    }
+
+    /// returns the old weights if it's overwritten
+    fn set_weights(
+        netuid: u16,
+        uid: u16,
+        weights: Option<Vec<(u16, u16)>>,
+    ) -> Option<Vec<(u16, u16)>> {
+        let old_weights = pallet_subnet_emission::Weights::<Test>::get(netuid, uid);
+        pallet_subnet_emission::Weights::<Test>::set(netuid, uid, weights);
+        old_weights
+    }
+
+    /// returns the removed weights if any
+    fn remove_weights(netuid: u16, uid: u16) -> Option<Vec<(u16, u16)>> {
+        let old_weights = pallet_subnet_emission::Weights::<Test>::get(netuid, uid);
+        pallet_subnet_emission::Weights::<Test>::remove(netuid, uid);
+        old_weights
+    }
+
+    fn set_subnet_weights(
+        netuid: u16,
+        weights: Option<Vec<(u16, Vec<(u16, u16)>)>>,
+    ) -> Option<Vec<(u16, Vec<(u16, u16)>)>> {
+        let old_weights = pallet_subnet_emission::Weights::<Test>::iter_prefix(netuid)
+            .collect::<Vec<(_, Vec<_>)>>();
+        let _ =
+            pallet_subnet_emission::Weights::<Test>::clear_prefix(netuid, u16::MAX as u32, None);
+        if let Some(weights) = weights {
+            for (uid, weights) in weights.into_iter() {
+                pallet_subnet_emission::Weights::<Test>::insert(netuid, uid, weights);
+            }
+        }
+
+        if old_weights.is_empty() {
+            None
+        } else {
+            Some(old_weights)
+        }
+    }
+
+    fn clear_subnet_weights(netuid: u16) -> Option<Vec<(u16, Vec<(u16, u16)>)>> {
+        let old_weights = pallet_subnet_emission::Weights::<Test>::iter_prefix(netuid)
+            .collect::<Vec<(_, Vec<_>)>>();
+        let _ =
+            pallet_subnet_emission::Weights::<Test>::clear_prefix(netuid, u16::MAX as u32, None);
+        if old_weights.is_empty() {
+            None
+        } else {
+            Some(old_weights)
+        }
+    }
 }
 
 impl pallet_subnet_emission::Config for Test {
@@ -284,6 +351,72 @@ impl pallet_balances::Config for Test {
     type FreezeIdentifier = ();
     type MaxFreezes = frame_support::traits::ConstU32<16>;
     type RuntimeFreezeReason = ();
+}
+
+// Things needed to impl offchain worker module
+// ============================================
+
+pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"offw");
+
+pub struct TestAuthId;
+
+impl AppCrypto<<Test as SigningTypes>::Public, <Test as SigningTypes>::Signature> for TestAuthId {
+    type RuntimeAppPublic = pallet_offworker::crypto::Public;
+    type GenericSignature = sp_core::sr25519::Signature;
+    type GenericPublic = sp_core::sr25519::Public;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Encode, Decode, TypeInfo)]
+pub struct CustomPublic(sr25519::Public);
+
+impl IdentifyAccount for CustomPublic {
+    type AccountId = u32;
+
+    fn into_account(self) -> Self::AccountId {
+        let bytes: &[u8] = self.0.as_ref();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+}
+
+impl From<sr25519::Public> for CustomPublic {
+    fn from(pub_key: sr25519::Public) -> Self {
+        CustomPublic(pub_key)
+    }
+}
+
+impl From<CustomPublic> for sr25519::Public {
+    fn from(custom_public: CustomPublic) -> Self {
+        custom_public.0
+    }
+}
+impl SigningTypes for Test {
+    type Public = CustomPublic;
+    type Signature = Signature;
+}
+
+impl CreateSignedTransaction<OffworkerCall<Test>> for Test {
+    fn create_transaction<C: AppCrypto<Self::Public, Self::Signature>>(
+        _call: OffworkerCall<Test>,
+        _public: Self::Public,
+        _account: AccountId,
+        _nonce: u32,
+    ) -> Option<(OffworkerCall<Test>, <UncheckedExtrinsic<AccountId, OffworkerCall<Test>, Signature, ()> as sp_runtime::traits::Extrinsic>::SignaturePayload)>{
+        None
+    }
+}
+
+impl frame_system::offchain::SendTransactionTypes<OffworkerCall<Test>> for Test {
+    type Extrinsic = UncheckedExtrinsic<AccountId, OffworkerCall<Test>, Signature, ()>;
+    type OverarchingCall = OffworkerCall<Test>;
+}
+
+impl pallet_offworker::Config for Test {
+    type AuthorityId = TestAuthId;
+    type RuntimeEvent = RuntimeEvent;
+    type GracePeriod = frame_support::traits::ConstU64<5>;
+    type UnsignedInterval = frame_support::traits::ConstU64<10>;
+    type UnsignedPriority = frame_support::traits::ConstU64<1000>;
+    type MaxPrices = frame_support::traits::ConstU32<64>;
 }
 
 impl system::Config for Test {
@@ -418,6 +551,21 @@ pub fn increase_stake(key: AccountId, stake: u64) {
     SubspaceMod::increase_stake(&key, &key, stake);
 }
 
+// Sets all key's stake to 0 and increases delegated stake to desired amount
+pub fn make_keys_all_stake_be(account: AccountId, stake: u64) {
+    let _ = StakeFrom::<Test>::clear_prefix(&account, u32::MAX, None);
+    let _ = StakeTo::<Test>::clear_prefix(&account, u32::MAX, None);
+
+    let keys_total_stake =
+        SubspaceMod::get_delegated_stake(&account) + SubspaceMod::get_owned_stake(&account);
+
+    TotalStake::<Test>::mutate(|total_stake| {
+        *total_stake = total_stake.saturating_sub(keys_total_stake).saturating_add(stake);
+    });
+
+    increase_stake(account, stake);
+}
+
 pub fn set_total_issuance(total_issuance: u64) {
     let key = DefaultKey::<Test>::get();
     // Reset the issuance (completelly nuke the key's balance)
@@ -430,6 +578,7 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
     sp_tracing::try_init_simple();
     let t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
     let mut ext = sp_io::TestExternalities::new(t);
+    ext.register_extension(testthing::OffworkerExt::new(Decrypter::default()));
     ext.execute_with(|| {});
     ext
 }
@@ -450,6 +599,15 @@ pub fn get_origin(key: AccountId) -> RuntimeOrigin {
 pub fn get_total_subnet_balance(netuid: u16) -> u64 {
     let keys = SubspaceMod::get_keys(netuid);
     keys.iter().map(SubspaceMod::get_balance_u64).sum()
+}
+
+/// Appends weight copier validator
+pub fn add_weight_copier(netuid: u16, key: u32, uids: Vec<u16>, values: Vec<u16>) {
+    let copier_stake = pallet_offworker::get_copier_stake::<Test>(netuid);
+    // registers module if not already registered
+    let _ = register_module(netuid, key, copier_stake, false);
+    step_block(1);
+    set_weights(netuid, key, uids, values);
 }
 
 #[allow(dead_code)]
@@ -669,10 +827,6 @@ pub fn register_root_validator(key: AccountId, stake: u64) -> Result<u16, Dispat
     pallet_subspace::Uids::<Test>::get(netuid, key).ok_or("uid is missing".into())
 }
 
-pub fn get_balance(key: AccountId) -> Balance {
-    <Balances as Currency<AccountId>>::free_balance(&key)
-}
-
 pub fn get_total_issuance() -> u64 {
     let total_staked_balance = TotalStake::<Test>::get();
     let total_free_balance = pallet_balances::Pallet::<Test>::total_issuance();
@@ -694,6 +848,13 @@ pub fn config(proposal_cost: u64, proposal_expiration: u32) {
         vote_mode: pallet_governance_api::VoteMode::Vote,
         ..Default::default()
     });
+}
+
+// Utility functions
+//===================
+
+pub fn get_balance(key: AccountId) -> Balance {
+    <Balances as Currency<AccountId>>::free_balance(&key)
 }
 
 #[allow(dead_code)]
@@ -759,3 +920,101 @@ macro_rules! assert_in_range {
 pub(crate) use assert_in_range;
 pub(crate) use assert_ok;
 pub(crate) use update_params;
+
+// TEMP
+
+struct Decrypter {
+    // TODO: swap this with the node's decryption key type and store it once it starts
+    key: rsa::RsaPrivateKey,
+}
+
+impl Default for Decrypter {
+    fn default() -> Self {
+        Self {
+            key: rsa::RsaPrivateKey::new(&mut OsRng, 1024).unwrap(),
+        }
+    }
+}
+
+impl testthing::OffworkerExtension for Decrypter {
+    fn decrypt_weight(&self, encrypted: Vec<u8>) -> Option<(Vec<u16>, Vec<u16>)> {
+        let Some(vec) = encrypted
+            .chunks(128)
+            .map(|chunk| match self.key.decrypt(Pkcs1v15Encrypt, &chunk) {
+                Ok(decrypted) => {
+                    return if decrypted.len() >= 8 {
+                        Some(decrypted[8..].to_vec())
+                    } else {
+                        None
+                    }
+                }
+                Err(err) => {
+                    dbg!(&chunk.len());
+                    dbg!(&err);
+                    None
+                }
+            })
+            .collect::<Option<Vec<Vec<u8>>>>()
+        else {
+            return None;
+        };
+
+        let decrypted = vec.into_iter().flat_map(|vec| vec).collect::<Vec<_>>();
+
+        let mut uids = Vec::new();
+        let mut weights = Vec::new();
+
+        let mut cursor = Cursor::new(&decrypted);
+
+        let Some(uid_length) = read_u32(&mut cursor) else {
+            return None;
+        };
+        for _ in 0..uid_length {
+            let Some(uid) = read_u16(&mut cursor) else {
+                return None;
+            };
+
+            uids.push(uid);
+        }
+
+        let Some(weight_len) = read_u32(&mut cursor) else {
+            return None;
+        };
+        for _ in 0..weight_len {
+            let Some(weight) = read_u16(&mut cursor) else {
+                return None;
+            };
+
+            weights.push(weight);
+        }
+
+        Some((uids, weights))
+    }
+
+    fn get_encryption_key(&self) -> (Vec<u8>, Vec<u8>) {
+        let public = rsa::RsaPublicKey::from(&self.key);
+        (public.n().to_bytes_be(), public.e().to_bytes_le())
+    }
+}
+
+fn read_u32(cursor: &mut Cursor<&Vec<u8>>) -> Option<u32> {
+    let mut buf: [u8; 4] = [0u8; 4];
+    match cursor.read_exact(&mut buf[..]) {
+        Ok(()) => Some(u32::from_be_bytes(buf)),
+        Err(err) => {
+            dbg!(&err);
+            None
+        }
+    }
+}
+
+fn read_u16(cursor: &mut Cursor<&Vec<u8>>) -> Option<u16> {
+    let mut buf = [0u8; 2];
+    match cursor.read_exact(&mut buf[..]) {
+        Ok(()) => Some(u16::from_be_bytes(buf)),
+        Err(err) => {
+            dbg!(&err);
+            None
+        }
+    }
+}

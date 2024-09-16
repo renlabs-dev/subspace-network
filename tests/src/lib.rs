@@ -6,9 +6,13 @@
 // ! To avoid redundancy and repetetion in mock modules, as well as circular dependencies.
 
 #[cfg(test)]
+pub mod encryption;
+#[cfg(test)]
 pub mod governance;
 #[cfg(test)]
 pub mod mock;
+#[cfg(test)]
+pub mod research;
 #[cfg(test)]
 pub mod root;
 #[cfg(test)]

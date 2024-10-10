@@ -1,13 +1,10 @@
 use crate::{
     subnet_consensus::util::{consensus::*, params},
-    EmissionError,
+    Config, EmissionError,
 };
-
-use crate::Config;
 use core::marker::PhantomData;
 use frame_support::DebugNoBound;
-use pallet_subspace::math::*;
-use sp_std::{vec, vec::Vec};
+use sp_std::vec::Vec;
 
 #[derive(DebugNoBound)]
 pub struct LinearEpoch<T: Config> {
@@ -33,7 +30,10 @@ impl<T: Config> LinearEpoch<T> {
         }
     }
 
-    pub fn run(self) -> Result<ConsensusOutput<T>, EmissionError> {
+    pub fn run(
+        self,
+        input_weights: Vec<(u16, Vec<(u16, u16)>)>,
+    ) -> Result<ConsensusOutput<T>, EmissionError> {
         log::debug!(
             "running linear for subnet_id {}, will emit {:?} modules and {:?} to founder",
             self.subnet_id,
@@ -45,6 +45,8 @@ impl<T: Config> LinearEpoch<T> {
             self.subnet_id
         );
 
+        let weights = prepare_weights::<T>(&self.modules, input_weights);
+
         // Stays for linear & yuma
         let (inactive, active) = split_modules_by_activity(
             &self.modules.last_update,
@@ -53,19 +55,20 @@ impl<T: Config> LinearEpoch<T> {
             self.params.current_block,
         );
 
+        let new_permits = calculate_new_permits::<T>(
+            &self.params,
+            &self.modules,
+            &self.modules.stake_original,
+            &weights,
+        );
+
         // Notice that linear consensus does not have mutable weights
-        let weights = compute_weights(&self.modules, &self.params)
+        let weights = compute_weights(&self.modules, &self.params, weights)
             .ok_or(EmissionError::Other("weights are broken"))?;
 
         // Stays for linear & yuma
         let stake = StakeVal::unchecked_from_inner(self.modules.stake_normalized.clone());
         log::trace!("final stake: {stake:?}");
-
-        let new_permits: Vec<bool> = if let Some(max) = self.params.max_allowed_validators {
-            is_topk(stake.as_ref(), max as usize)
-        } else {
-            vec![true; stake.as_ref().len()]
-        };
 
         log::trace!("new permis: {new_permits:?}");
 

@@ -23,8 +23,8 @@ use parity_scale_codec::{Decode, Encode};
 use rand::rngs::OsRng;
 use rsa::{traits::PublicKeyParts, Pkcs1v15Encrypt};
 use scale_info::{prelude::collections::BTreeSet, TypeInfo};
-use sha2::Digest;
-use sp_core::{sr25519, ConstU16, H256};
+
+use sp_core::{sr25519, ConstU16, ConstU64, H256};
 use sp_runtime::{
     generic::UncheckedExtrinsic,
     traits::{AccountIdConversion, BlakeTwo256, IdentifyAccount, IdentityLookup},
@@ -33,7 +33,6 @@ use sp_runtime::{
 use std::{
     cell::RefCell,
     io::{Cursor, Read},
-    iter::Copied,
 };
 
 frame_support::construct_runtime!(
@@ -329,6 +328,7 @@ impl pallet_subnet_emission::Config for Test {
     type Decimals = Decimals;
     type HalvingInterval = HalvingInterval;
     type MaxSupply = MaxSupply;
+    type DecryptionNodeRotationInterval = ConstU64<5_000>;
 }
 
 impl pallet_governance::Config for Test {
@@ -414,10 +414,7 @@ impl frame_system::offchain::SendTransactionTypes<OffworkerCall<Test>> for Test 
 impl pallet_offworker::Config for Test {
     type AuthorityId = TestAuthId;
     type RuntimeEvent = RuntimeEvent;
-    type GracePeriod = frame_support::traits::ConstU64<5>;
-    type UnsignedInterval = frame_support::traits::ConstU64<10>;
-    type UnsignedPriority = frame_support::traits::ConstU64<1000>;
-    type MaxPrices = frame_support::traits::ConstU32<64>;
+    type MaxEncryptionTime = ConstU64<10_800>;
 }
 
 impl system::Config for Test {
@@ -602,15 +599,6 @@ pub fn get_total_subnet_balance(netuid: u16) -> u64 {
     keys.iter().map(SubspaceMod::get_balance_u64).sum()
 }
 
-// /// Appends weight copier validator
-// pub fn add_weight_copier(netuid: u16, key: u32, uids: Vec<u16>, values: Vec<u16>) {
-//     let copier_stake = pallet_offworker::get_copier_stake::<Test>(netuid);
-//     // registers module if not already registered
-//     let _ = register_module(netuid, key, copier_stake, false);
-//     step_block(1);
-//     set_weights(netuid, key, uids, values);
-// }
-
 #[allow(dead_code)]
 pub(crate) fn step_block(n: u16) {
     for _ in 0..n {
@@ -646,6 +634,22 @@ pub(crate) fn step_epoch(netuid: u16) {
 #[allow(dead_code)]
 pub fn set_weights(netuid: u16, key: AccountId, uids: Vec<u16>, values: Vec<u16>) {
     SubnetEmissionMod::set_weights(get_origin(key), netuid, uids.clone(), values.clone()).unwrap();
+}
+
+#[allow(dead_code)]
+pub fn set_weights_encrypted(
+    netuid: u16,
+    key: AccountId,
+    encrypted_weights: Vec<u8>,
+    decrypted_weights_hash: Vec<u8>,
+) {
+    SubnetEmissionMod::set_weights_encrypted(
+        get_origin(key),
+        netuid,
+        encrypted_weights,
+        decrypted_weights_hash,
+    )
+    .unwrap();
 }
 
 #[allow(dead_code)]
@@ -938,20 +942,6 @@ impl Default for Decrypter {
 }
 
 impl ow_extensions::OffworkerExtension for Decrypter {
-    fn hash_weight(
-        &self,
-        weights: pallet_subspace::Vec<(u16, u16)>,
-    ) -> Option<pallet_subspace::Vec<u8>> {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update((weights.len() as u32).to_be_bytes());
-        for (uid, weight) in weights {
-            hasher.update(uid.to_be_bytes());
-            hasher.update(weight.to_be_bytes());
-        }
-
-        Some(hasher.finalize().to_vec())
-    }
-
     fn decrypt_weight(&self, encrypted: Vec<u8>) -> Option<Vec<(u16, u16)>> {
         let Some(key) = &self.key else {
             return None;
@@ -961,7 +951,7 @@ impl ow_extensions::OffworkerExtension for Decrypter {
             .chunks(dbg!(key.size()))
             .map(|chunk| match key.decrypt(Pkcs1v15Encrypt, &chunk) {
                 Ok(decrypted) => Some(decrypted),
-                Err(err) => None,
+                Err(_) => None,
             })
             .collect::<Option<Vec<Vec<u8>>>>()
         else {
@@ -993,7 +983,7 @@ impl ow_extensions::OffworkerExtension for Decrypter {
     }
 
     fn is_decryption_node(&self) -> bool {
-        self.key.is_some()
+        true
     }
 
     fn get_encryption_key(&self) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -1002,7 +992,7 @@ impl ow_extensions::OffworkerExtension for Decrypter {
         };
 
         let public = rsa::RsaPublicKey::from(key);
-        Some((public.n().to_bytes_be(), public.e().to_bytes_le()))
+        Some((public.n().to_bytes_be(), public.e().to_bytes_be()))
     }
 }
 

@@ -15,10 +15,14 @@ targets = ["x86_64-unknown-linux-gnu"]
 [dependencies]
 
 [dev-dependencies]
+
+parking_lot = "0.12.0"
+
 sha2.workspace = true
 rsa.workspace = true
 bty = { workspace = true }
 csv = "1.1"
+hex = { workspace = true }
 
 ow_extensions = { path = "../ow_extensions" }
 
@@ -51,6 +55,8 @@ sp-arithmetic = { workspace = true }
 sp-core = { workspace = true }
 sp-io = { workspace = true }
 sp-runtime = { workspace = true }
+sp-externalities = { workspace = true }
+sp-keystore = { workspace = true }
 
 sp-std = { workspace = true }
 sp-tracing = { workspace = true }

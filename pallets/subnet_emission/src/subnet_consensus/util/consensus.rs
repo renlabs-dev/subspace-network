@@ -4,7 +4,7 @@ use frame_support::{ensure, DebugNoBound};
 use pallet_subspace::{math::*, vec, BalanceOf, Pallet as PalletSubspace};
 use parity_scale_codec::{Decode, Encode};
 use scale_info::TypeInfo;
-use sp_std::{borrow::Cow, collections::btree_map::BTreeMap, vec::Vec};
+use sp_std::{borrow::Cow, cmp::Ordering, collections::btree_map::BTreeMap, vec::Vec};
 use substrate_fixed::types::{I32F32, I64F64, I96F32};
 
 use crate::Config;
@@ -122,9 +122,14 @@ pub fn calculate_final_emissions<T: Config>(
 pub fn compute_weights<T: Config>(
     modules: &FlattenedModules<T::AccountId>,
     params: &ConsensusParams<T>,
+    mut weights: Vec<(u16, Vec<(u16, u16)>)>,
 ) -> Option<WeightsVal> {
-    // Access network weights row unnormalized.
-    let mut weights = modules.weights_unencrypted.clone();
+    weights.sort_by_key(|(uid, _)| *uid);
+
+    let mut weights = weights
+        .into_iter()
+        .map(|(_, vec)| vec.into_iter().map(|(key, value)| (key, I32F32::from(value))).collect())
+        .collect::<Vec<_>>();
     log::trace!("  original weights: {weights:?}");
 
     let validator_forbids: Vec<bool> = modules.validator_permit.iter().map(|&b| !b).collect();
@@ -425,7 +430,6 @@ pub fn compute_bonds_and_dividends_yuma<T: Config>(
     inplace_col_normalize_sparse(&mut bonds, modules.module_count());
     log::trace!("  normalized bonds: {bonds:?}");
 
-    // Compute bonds delta column normalized.
     let mut bonds_delta = row_hadamard_sparse(weights.as_ref(), active_stake.as_ref()); // ΔB = W◦S (outdated W masked)
     log::trace!("  original bonds delta: {bonds_delta:?}");
 
@@ -631,6 +635,58 @@ pub fn process_consensus_output<T: Config>(
 
         params: params.clone(),
     })
+}
+
+pub fn calculate_new_permits<T: Config>(
+    params: &ConsensusParams<T>,
+    modules: &FlattenedModules<T::AccountId>,
+    stake: &[I64F64],
+    input_weights: &[(u16, Vec<(u16, u16)>)],
+) -> Vec<bool> {
+    let max_validators = params.max_allowed_validators.unwrap_or(u16::MAX) as usize;
+    let current_block = params.current_block;
+    let tolerance_inactivity = params.activity_cutoff.saturating_mul(2);
+
+    let mut indexed_stake: Vec<_> = stake
+        .iter()
+        .enumerate()
+        .filter(|&(idx, &stake)| {
+            stake >= params.min_val_stake
+                && modules.last_update.get(idx).map_or(false, |&last_update| {
+                    current_block.saturating_sub(last_update) <= tolerance_inactivity
+                })
+                && input_weights
+                    .iter()
+                    .any(|&(uid, ref weights)| uid == idx as u16 && !weights.is_empty())
+        })
+        .collect();
+
+    indexed_stake.sort_unstable_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(Ordering::Equal));
+
+    let mut permits = vec![false; stake.len()];
+    indexed_stake.into_iter().take(max_validators).for_each(|(idx, _)| {
+        if let Some(permit) = permits.get_mut(idx) {
+            *permit = true;
+        }
+    });
+
+    permits
+}
+
+pub fn prepare_weights<T: Config>(
+    modules: &FlattenedModules<T::AccountId>,
+    input_weights: Vec<(u16, Vec<(u16, u16)>)>,
+) -> Vec<(u16, Vec<(u16, u16)>)> {
+    let uids: BTreeMap<u16, ()> =
+        modules.keys.iter().enumerate().map(|(index, _)| (index as u16, ())).collect();
+
+    // Convert input weights to a BTreeMap for easier manipulation
+    let mut weights: BTreeMap<u16, Vec<(u16, u16)>> = input_weights.into_iter().collect();
+
+    // Map over uids, keeping the uid and collecting weights
+    uids.keys()
+        .map(|&uid| (uid, weights.remove(&uid).unwrap_or_default()))
+        .collect()
 }
 
 #[derive(DebugNoBound, Clone, Encode, Decode, TypeInfo)]

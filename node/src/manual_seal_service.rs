@@ -11,7 +11,6 @@ use sc_executor::WasmExecutor;
 use sc_service::{error::Error as ServiceError, Configuration, TaskManager};
 use sc_telemetry::{Telemetry, TelemetryWorker};
 use sc_transaction_pool_api::OffchainTransactionPoolFactory;
-use sha2::Digest;
 use std::{
     io::{Cursor, Read},
     sync::Arc,
@@ -266,24 +265,13 @@ impl Default for Decrypter {
 }
 
 impl ow_extensions::OffworkerExtension for Decrypter {
-    fn hash_weight(&self, weights: Vec<(u16, u16)>) -> Option<Vec<u8>> {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update((weights.len() as u32).to_be_bytes());
-        for (uid, weight) in weights {
-            hasher.update(uid.to_be_bytes());
-            hasher.update(weight.to_be_bytes());
-        }
-
-        Some(hasher.finalize().to_vec())
-    }
-
     fn decrypt_weight(&self, encrypted: Vec<u8>) -> Option<Vec<(u16, u16)>> {
         let Some(key) = &self.key else {
             return None;
         };
 
         let Some(vec) = encrypted
-            .chunks(dbg!(key.size()))
+            .chunks(key.size())
             .map(|chunk| match key.decrypt(Pkcs1v15Encrypt, &chunk) {
                 Ok(decrypted) => Some(decrypted),
                 Err(_) => None,

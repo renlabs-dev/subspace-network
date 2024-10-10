@@ -1,11 +1,11 @@
 use core::fmt::Debug;
 
-use crate::{Config, EncryptedWeightHashes, EncryptedWeights, Weights};
+use crate::{Config, DecryptedWeightHashes, EncryptedWeights};
 use frame_support::DebugNoBound;
 use pallet_subspace::{
     math::*, AlphaValues, BalanceOf, Bonds, BondsMovingAverage, Founder, Kappa, Keys, LastUpdate,
-    MaxAllowedValidators, MaxWeightAge, Pallet as PalletSubspace, UseWeightsEncrytyption,
-    ValidatorPermits, Vec,
+    MaxAllowedValidators, MaxWeightAge, MinValidatorStake, Pallet as PalletSubspace,
+    UseWeightsEncrytyption, ValidatorPermits, Vec,
 };
 use parity_scale_codec::{Decode, Encode};
 use scale_info::TypeInfo;
@@ -36,6 +36,7 @@ pub struct ConsensusParams<T: Config> {
     pub max_allowed_validators: Option<u16>,
     pub bonds_moving_average: u64,
     pub alpha_values: (I32F32, I32F32),
+    pub min_val_stake: I64F64,
 }
 
 #[derive(Clone, Encode, Decode, TypeInfo, Debug)]
@@ -47,8 +48,8 @@ pub struct ModuleParams {
     pub stake_normalized: I32F32,
     pub stake_original: I64F64, // Use for WC simulation purposes
     pub bonds: Vec<(u16, u16)>,
-    pub weight_unencrypted_hash: Vec<u8>,
     pub weight_encrypted: Vec<u8>,
+    pub weight_hash: Vec<u8>,
 }
 
 #[derive(DebugNoBound)]
@@ -59,10 +60,10 @@ pub struct FlattenedModules<AccountId: Debug> {
     pub validator_permit: Vec<bool>,
     pub validator_forbid: Vec<bool>,
     pub stake_normalized: Vec<I32F32>,
+    pub stake_original: Vec<I64F64>,
     pub bonds: Vec<Vec<(u16, I32F32)>>,
     pub weight_unencrypted_hash: Vec<Vec<u8>>,
     pub weight_encrypted: Vec<Vec<u8>>,
-    pub weights_unencrypted: Vec<Vec<(u16, I32F32)>>,
 }
 
 impl<AccountId: Debug> From<BTreeMap<ModuleKey<AccountId>, ModuleParams>>
@@ -76,10 +77,10 @@ impl<AccountId: Debug> From<BTreeMap<ModuleKey<AccountId>, ModuleParams>>
             validator_permit: Vec::with_capacity(value.len()),
             validator_forbid: Vec::with_capacity(value.len()),
             stake_normalized: Vec::with_capacity(value.len()),
+            stake_original: Vec::with_capacity(value.len()),
             bonds: Vec::with_capacity(value.len()),
             weight_unencrypted_hash: Vec::with_capacity(value.len()),
             weight_encrypted: Vec::with_capacity(value.len()),
-            weights_unencrypted: Vec::with_capacity(value.len()),
         };
 
         for (key, module) in value {
@@ -89,10 +90,10 @@ impl<AccountId: Debug> From<BTreeMap<ModuleKey<AccountId>, ModuleParams>>
             modules.validator_permit.push(module.validator_permit);
             modules.validator_forbid.push(!module.validator_permit);
             modules.stake_normalized.push(module.stake_normalized);
+            modules.stake_original.push(module.stake_original);
             modules
                 .bonds
                 .push(module.bonds.into_iter().map(|(k, m)| (k, I32F32::from_num(m))).collect());
-            modules.weight_unencrypted_hash.push(module.weight_unencrypted_hash);
             modules.weight_encrypted.push(module.weight_encrypted);
         }
 
@@ -113,7 +114,6 @@ impl<T: Config> ConsensusParams<T> {
 
         let (stake_original, stake_normalized) = Self::compute_stake(&uids);
         let bonds = Self::compute_bonds(subnet_id, &uids);
-        let weights = Self::compute_weights(subnet_id, &uids);
 
         let last_update = LastUpdate::<T>::get(subnet_id);
         let block_at_registration = PalletSubspace::<T>::get_block_at_registration(subnet_id);
@@ -125,9 +125,8 @@ impl<T: Config> ConsensusParams<T> {
             .zip(stake_normalized)
             .zip(stake_original)
             .zip(bonds)
-            .zip(weights)
             .map(
-                |(((((uid, key), stake_normalized), stake_original), bonds), weights)| {
+                |((((uid, key), stake_normalized), stake_original), bonds)| {
                     let uid = uid as usize;
                     let last_update =
                         last_update.get(uid).copied().ok_or("LastUpdate storage is broken")?;
@@ -148,11 +147,9 @@ impl<T: Config> ConsensusParams<T> {
                         stake_normalized,
                         stake_original,
                         bonds,
-                        weight_unencrypted_hash: EncryptedWeightHashes::<T>::get(
-                            subnet_id, uid as u16,
-                        )
-                        .unwrap_or_default(), // TODO CHECK THIS
                         weight_encrypted: EncryptedWeights::<T>::get(subnet_id, uid as u16)
+                            .unwrap_or_default(), // TODO CHECK THIS
+                        weight_hash: DecryptedWeightHashes::<T>::get(subnet_id, uid as u16)
                             .unwrap_or_default(), // TODO CHECK THIS
                     };
 
@@ -186,9 +183,12 @@ impl<T: Config> ConsensusParams<T> {
             max_allowed_validators: MaxAllowedValidators::<T>::get(subnet_id),
             bonds_moving_average: BondsMovingAverage::<T>::get(subnet_id),
             alpha_values,
+            min_val_stake: I64F64::from_num(MinValidatorStake::<T>::get(subnet_id)),
         })
     }
 
+    /// This function outputs stake for every uid, if the stake from value is not present, it
+    /// defaults to 0.
     fn compute_stake(uids: &BTreeMap<u16, T::AccountId>) -> (Vec<I64F64>, Vec<I32F32>) {
         // BTreeMap provides natural order, so iterating and collecting
         // will result in a vector with the same order as the uid map.
@@ -213,13 +213,6 @@ impl<T: Config> ConsensusParams<T> {
         // BTreeMap provides natural order, so iterating and collecting
         // will result in a vector with the same order as the uid map.
         uids.keys().map(|uid| bonds.remove(uid).unwrap_or_default()).collect()
-    }
-
-    fn compute_weights(subnet_id: u16, uids: &BTreeMap<u16, T::AccountId>) -> Vec<Vec<(u16, u16)>> {
-        let mut weights: BTreeMap<_, _> = Weights::<T>::iter_prefix(subnet_id).collect();
-        // BTreeMap provides natural order, so iterating and collecting
-        // will result in a vector with the same order as the uid map.
-        uids.keys().map(|uid| weights.remove(uid).unwrap_or_default()).collect()
     }
 
     pub fn get_alpha_values_32(netuid: u16) -> (I32F32, I32F32) {

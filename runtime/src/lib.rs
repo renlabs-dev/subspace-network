@@ -23,14 +23,13 @@ use pallet_subnet_emission_api::SubnetConsensus;
 use smallvec::smallvec;
 use sp_api::impl_runtime_apis;
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
-use sp_core::{crypto::KeyTypeId, OpaqueMetadata, H160, U256};
+use sp_core::{crypto::KeyTypeId, OpaqueMetadata};
 use sp_runtime::{
     create_runtime_str, generic, impl_opaque_keys,
     traits::{
-        AccountIdLookup, BlakeTwo256, Block as BlockT, DispatchInfoOf, IdentifyAccount, NumberFor,
-        One, PostDispatchInfoOf, Verify,
+        AccountIdLookup, BlakeTwo256, Block as BlockT, IdentifyAccount, NumberFor, One, Verify,
     },
-    transaction_validity::{TransactionSource, TransactionValidity, TransactionValidityError},
+    transaction_validity::{TransactionSource, TransactionValidity},
     ApplyExtrinsicResult, DispatchResult, MultiSignature,
 };
 use sp_std::{collections::btree_set::BTreeSet, prelude::*};
@@ -400,39 +399,6 @@ pub const MAXIMUM_BLOCK_WEIGHT: Weight = Weight::from_parts(
 );
 pub const MAXIMUM_BLOCK_LENGTH: u32 = 5 * 1024 * 1024;
 
-const BLOCK_GAS_LIMIT: u64 = 75_000_000;
-const MAX_POV_SIZE: u64 = 5 * 1024 * 1024;
-
-parameter_types! {
-    pub BlockGasLimit: U256 = U256::from(BLOCK_GAS_LIMIT);
-    pub const GasLimitPovSizeRatio: u64 = BLOCK_GAS_LIMIT.saturating_div(MAX_POV_SIZE);
-}
-
-parameter_types! {
-    pub DefaultBaseFeePerGas: U256 = U256::from(1_000_000_000);
-    pub DefaultElasticity: Permill = Permill::from_parts(125_000);
-}
-
-pub struct BaseFeeThreshold;
-impl pallet_base_fee::BaseFeeThreshold for BaseFeeThreshold {
-    fn lower() -> Permill {
-        Permill::zero()
-    }
-    fn ideal() -> Permill {
-        Permill::from_parts(500_000)
-    }
-    fn upper() -> Permill {
-        Permill::from_parts(1_000_000)
-    }
-}
-
-impl pallet_base_fee::Config for Runtime {
-    type RuntimeEvent = RuntimeEvent;
-    type Threshold = BaseFeeThreshold;
-    type DefaultBaseFeePerGas = DefaultBaseFeePerGas;
-    type DefaultElasticity = DefaultElasticity;
-}
-
 // Create the runtime by composing the FRAME pallets that were previously configured.
 construct_runtime!(
     pub enum Runtime
@@ -453,9 +419,6 @@ construct_runtime!(
 
         #[cfg(feature = "testnet-faucet")]
         FaucetModule: pallet_faucet,
-
-        // EVM Support
-        BaseFee: pallet_base_fee,
     }
 );
 
@@ -480,12 +443,8 @@ pub type SignedExtra = (
     pallet_transaction_payment::ChargeTransactionPayment<Runtime>,
 );
 
-// Unchecked extrinsic type as expected by this runtime.
 pub type UncheckedExtrinsic =
-    fp_self_contained::UncheckedExtrinsic<Address, RuntimeCall, Signature, SignedExtra>;
-/// Extrinsic type that has already been checked.
-pub type CheckedExtrinsic =
-    fp_self_contained::CheckedExtrinsic<AccountId, RuntimeCall, SignedExtra, H160>;
+    generic::UncheckedExtrinsic<Address, RuntimeCall, Signature, SignedExtra>;
 // The payload being signed in transactions.
 pub type SignedPayload = generic::SignedPayload<RuntimeCall, SignedExtra>;
 // Executive: handles dispatch to the various modules.
@@ -497,43 +456,6 @@ pub type Executive = frame_executive::Executive<
     AllPalletsWithSystem,
     Migrations,
 >;
-
-impl fp_self_contained::SelfContainedCall for RuntimeCall {
-    type SignedInfo = H160;
-
-    fn is_self_contained(&self) -> bool {
-        false
-    }
-
-    fn check_self_contained(&self) -> Option<Result<Self::SignedInfo, TransactionValidityError>> {
-        None
-    }
-
-    fn validate_self_contained(
-        &self,
-        _info: &Self::SignedInfo,
-        _dispatch_info: &DispatchInfoOf<RuntimeCall>,
-        _len: usize,
-    ) -> Option<TransactionValidity> {
-        None
-    }
-
-    fn pre_dispatch_self_contained(
-        &self,
-        _info: &Self::SignedInfo,
-        _dispatch_info: &DispatchInfoOf<RuntimeCall>,
-        _len: usize,
-    ) -> Option<Result<(), TransactionValidityError>> {
-        None
-    }
-
-    fn apply_self_contained(
-        self,
-        _info: Self::SignedInfo,
-    ) -> Option<sp_runtime::DispatchResultWithInfo<PostDispatchInfoOf<Self>>> {
-        None
-    }
-}
 
 #[cfg(feature = "runtime-benchmarks")]
 #[macro_use]

@@ -59,16 +59,6 @@ pallet-transaction-payment-rpc-runtime-api.workspace = true
 frame-benchmarking = { workspace = true, optional = true }
 frame-system-benchmarking = { workspace = true, optional = true }
 
-# EVM Support
-
-# Frontier
-fp-account.workspace = true
-fp-rpc.workspace = true
-fp-self-contained.workspace = true
-
-# Frontier FRAME
-pallet-base-fee.workspace = true
-
 subspace-runtime-api = { path = "../pallets/subspace/rpc/runtime-api", default-features = false }
 pallet-governance-api = { path = "../pallets/governance/api", default-features = false }
 pallet-subnet-emission-api = { path = "../pallets/subnet_emission/api", default-features = false }
@@ -115,7 +105,6 @@ std = [
     "sp-transaction-pool/std",
     "sp-version/std",
     "substrate-wasm-builder",
-    "pallet-base-fee/std",
     "subspace-runtime-api/std",
 ]
 runtime-benchmarks = [
@@ -138,7 +127,6 @@ try-runtime = [
     "frame-try-runtime/try-runtime",
     "pallet-aura/try-runtime",
     "pallet-balances/try-runtime",
-    "pallet-base-fee/try-runtime",
     "pallet-grandpa/try-runtime",
     "pallet-insecure-randomness-collective-flip/try-runtime",
     "pallet-multisig/try-runtime",

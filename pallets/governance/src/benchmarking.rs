@@ -38,6 +38,11 @@ fn register_mock<T: Config>(
         SubspaceMod::<T>::u64_to_balance(SubnetBurn::<T>::get() + enough_stake).unwrap(),
     );
     let metadata = Some("metadata".as_bytes().to_vec());
+    let _ = SubspaceMod::<T>::register_subnet(
+        RawOrigin::Signed(key.clone()).into(),
+        network.clone(),
+        None,
+    );
     SubspaceMod::<T>::register(
         RawOrigin::Signed(key.clone()).into(),
         network,
@@ -117,7 +122,6 @@ benchmarks! {
             params.min_allowed_weights,
             params.max_weight_age,
             params.tempo,
-            params.trust_ratio,
             params.maximum_set_weight_calls_per_epoch,
             VoteMode::Vote,
             params.bonds_ma,
@@ -148,7 +152,6 @@ benchmarks! {
         params.min_allowed_weights,
         params.max_weight_age,
         params.tempo,
-        params.trust_ratio,
         params.maximum_set_weight_calls_per_epoch,
         VoteMode::Vote,
         params.bonds_ma,

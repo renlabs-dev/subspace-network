@@ -2,6 +2,7 @@
 
 use futures::FutureExt;
 use node_subspace_runtime::{self, opaque::Block, RuntimeApi};
+use rsa::{pkcs1::DecodeRsaPrivateKey, traits::PublicKeyParts, Pkcs1v15Encrypt};
 use sc_client_api::Backend;
 use sc_consensus_manual_seal::consensus::{
     aura::AuraConsensusDataProvider, timestamp::SlotTimestampProvider,
@@ -10,10 +11,18 @@ use sc_executor::WasmExecutor;
 use sc_service::{error::Error as ServiceError, Configuration, TaskManager};
 use sc_telemetry::{Telemetry, TelemetryWorker};
 use sc_transaction_pool_api::OffchainTransactionPoolFactory;
-use std::sync::Arc;
+use std::{
+    io::{Cursor, Read},
+    sync::Arc,
+};
+
+type CustomHostFunctions = (
+    sp_io::SubstrateHostFunctions,
+    ow_extensions::offworker::HostFunctions,
+);
 
 pub(crate) type FullClient =
-    sc_service::TFullClient<Block, RuntimeApi, WasmExecutor<sp_io::SubstrateHostFunctions>>;
+    sc_service::TFullClient<Block, RuntimeApi, WasmExecutor<CustomHostFunctions>>;
 type FullBackend = sc_service::TFullBackend<Block>;
 type FullSelectChain = sc_consensus::LongestChain<FullBackend, Block>;
 
@@ -51,6 +60,7 @@ pub fn new_partial(
             telemetry.as_ref().map(|(_, telemetry)| telemetry.handle()),
             executor,
         )?;
+
     let client = Arc::new(client);
 
     let telemetry = telemetry.map(|(worker, telemetry)| {
@@ -128,7 +138,9 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
                 )),
                 network_provider: network.clone(),
                 enable_http_requests: true,
-                custom_extensions: |_| vec![],
+                custom_extensions: |_| {
+                    vec![Box::new(ow_extensions::OffworkerExt::new(Decrypter::default())) as Box<_>]
+                },
             })
             .run(client.clone(), task_manager.spawn_handle())
             .boxed(),
@@ -222,5 +234,96 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
         .spawn_blocking("manual-seal", None, authorship_future);
 
     network_starter.start_network();
+
     Ok(task_manager)
+}
+
+struct Decrypter {
+    key: Option<rsa::RsaPrivateKey>,
+}
+
+impl Default for Decrypter {
+    fn default() -> Self {
+        let decryption_key_path = std::path::Path::new("decryption.pem");
+
+        if !decryption_key_path.exists() {
+            return Self { key: None };
+        }
+
+        let Ok(content) = std::fs::read_to_string(decryption_key_path) else {
+            // log::error!("could not read key file contents");
+            return Self { key: None };
+        };
+
+        let Ok(key) = rsa::RsaPrivateKey::from_pkcs1_pem(&content) else {
+            // log::error!("could not read key from file contents");
+            return Self { key: None };
+        };
+
+        Self { key: Some(key) }
+    }
+}
+
+impl ow_extensions::OffworkerExtension for Decrypter {
+    fn decrypt_weight(&self, encrypted: Vec<u8>) -> Option<(Vec<(u16, u16)>, Vec<u8>)> {
+        let Some(key) = &self.key else {
+            return None;
+        };
+
+        let vec = encrypted
+            .chunks(key.size())
+            .map(|chunk| match key.decrypt(Pkcs1v15Encrypt, chunk) {
+                Ok(decrypted) => Some(decrypted),
+                Err(_) => None,
+            })
+            .collect::<Option<Vec<Vec<u8>>>>()?;
+
+        let decrypted = vec.into_iter().flatten().collect::<Vec<_>>();
+
+        let mut res = Vec::new();
+
+        let mut cursor = Cursor::new(&decrypted);
+
+        let length = read_u32(&mut cursor)?;
+        for _ in 0..length {
+            let uid = read_u16(&mut cursor)?;
+            let weight = read_u16(&mut cursor)?;
+
+            res.push((uid, weight));
+        }
+
+        let mut key = Vec::new();
+        cursor.read_to_end(&mut key).ok()?;
+
+        Some((res, key))
+    }
+
+    fn is_decryption_node(&self) -> bool {
+        self.key.is_some()
+    }
+
+    fn get_encryption_key(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let Some(key) = &self.key else {
+            return None;
+        };
+
+        let public = rsa::RsaPublicKey::from(key);
+        Some((public.n().to_bytes_be(), public.e().to_bytes_le()))
+    }
+}
+
+fn read_u32(cursor: &mut Cursor<&Vec<u8>>) -> Option<u32> {
+    let mut buf: [u8; 4] = [0u8; 4];
+    match cursor.read_exact(&mut buf[..]) {
+        Ok(()) => Some(u32::from_be_bytes(buf)),
+        Err(_) => None,
+    }
+}
+
+fn read_u16(cursor: &mut Cursor<&Vec<u8>>) -> Option<u16> {
+    let mut buf = [0u8; 2];
+    match cursor.read_exact(&mut buf[..]) {
+        Ok(()) => Some(u16::from_be_bytes(buf)),
+        Err(_) => None,
+    }
 }

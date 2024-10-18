@@ -1,13 +1,18 @@
 #![allow(non_snake_case)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+use crate::types::{BlockWeights, DecryptionNodeInfo, PublicKey, SubnetDecryptionInfo};
+use frame_system::pallet_prelude::OriginFor;
 pub use pallet::*;
-use sp_std::collections::btree_map::BTreeMap;
+use parity_scale_codec::{Decode, Encode};
+use scale_info::TypeInfo;
+use sp_std::{collections::btree_map::BTreeMap, vec::Vec};
 // ! Pallet that handles the emisson distribution amongs subnets
 
 // Pallet Imports
 // ==============
 
+pub mod decryption;
 pub mod distribute_emission;
 pub mod migrations;
 pub mod subnet_pricing {
@@ -15,23 +20,26 @@ pub mod subnet_pricing {
     pub mod root;
 }
 
+pub mod set_weights;
 pub mod subnet_consensus;
+pub mod types;
 
-// TODO:
-// move some import outside of the macro
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+
 #[frame_support::pallet]
 pub mod pallet {
-    use crate::*;
+    use crate::{subnet_consensus::util::params::ConsensusParams, *};
     use frame_support::{
-        pallet_prelude::*,
+        pallet_prelude::{ValueQuery, *},
         sp_runtime::SaturatedConversion,
         storage::with_storage_layer,
         traits::{ConstU64, Currency},
+        // Identity,
     };
     use frame_system::pallet_prelude::BlockNumberFor;
     use pallet_subnet_emission_api::SubnetConsensus;
     use pallet_subspace::TotalStake;
-
     use subnet_pricing::root::RootPricing;
 
     const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
@@ -46,6 +54,7 @@ pub mod pallet {
         frame_system::Config
         + pallet_subspace::Config
         + pallet_governance_api::GovernanceApi<<Self as frame_system::Config>::AccountId>
+        + scale_info::TypeInfo
     {
         /// The events emitted on proposal changes.
         #[pallet::no_default_bounds]
@@ -64,11 +73,57 @@ pub mod pallet {
         /// The maximum token supply.
         #[pallet::constant]
         type MaxSupply: Get<u64>;
+
+        #[pallet::constant]
+        type DecryptionNodeRotationInterval: Get<u64>;
+
+        /// Maximum number of authorities.
+        #[pallet::constant]
+        type MaxAuthorities: Get<u32>;
+
+        /// The number of blocks within which a node must have sent a keep-alive to be considered
+        /// active.
+        #[pallet::constant]
+        type MaxKeepAlive: Get<u64>;
     }
 
     // Storage
     // ==========
 
+    // Weight Related
+
+    #[pallet::storage]
+    pub type Weights<T> = StorageDoubleMap<_, Identity, u16, Identity, u16, Vec<(u16, u16)>>;
+
+    #[pallet::storage]
+    pub type EncryptedWeights<T> = StorageDoubleMap<_, Identity, u16, Identity, u16, Vec<u8>>;
+
+    // Weight copying preventions
+    #[pallet::storage]
+    pub type DecryptedWeights<T> =
+        StorageMap<_, Identity, u16, Vec<(u64, Vec<(u16, Vec<(u16, u16)>)>)>>;
+
+    #[pallet::storage]
+    pub type DecryptedWeightHashes<T> = StorageDoubleMap<_, Identity, u16, Identity, u16, Vec<u8>>;
+
+    /// Association of signing public keys with associated rsa encryption public keys.
+    #[pallet::storage]
+    pub type Authorities<T: Config> =
+        StorageValue<_, BoundedVec<(T::AccountId, PublicKey), T::MaxAuthorities>, ValueQuery>;
+
+    /// This storage is managed dynamically based on the do_keep_alive offchain worker call
+    /// It is built from the authority keys
+    #[pallet::storage]
+    pub type DecryptionNodes<T> = StorageValue<_, Vec<DecryptionNodeInfo<T>>, ValueQuery>;
+
+    /// Decryption Node Info assigned to subnet
+    #[pallet::storage]
+    pub type SubnetDecryptionData<T> = StorageMap<_, Identity, u16, SubnetDecryptionInfo<T>>;
+
+    #[pallet::storage]
+    pub type DecryptionNodeCursor<T> = StorageValue<_, u16, ValueQuery>;
+
+    // Subnet Pricing & Consensus
     #[pallet::storage]
     pub type UnitEmission<T> = StorageValue<_, u64, ValueQuery, ConstU64<23148148148>>;
 
@@ -80,6 +135,11 @@ pub mod pallet {
 
     #[pallet::storage]
     pub type SubnetConsensusType<T> = StorageMap<_, Identity, u16, SubnetConsensus>;
+
+    /// Netuid, to block number to consensus parameters
+    #[pallet::storage]
+    pub type ConsensusParameters<T> =
+        StorageDoubleMap<_, Identity, u16, Identity, u64, ConsensusParams<T>, OptionQuery>;
 
     type BalanceOf<T> =
         <<T as Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
@@ -96,6 +156,9 @@ pub mod pallet {
             let block_number: u64 =
                 block_number.try_into().ok().expect("blockchain won't pass 2 ^ 64 blocks");
 
+            Self::distribute_subnets_to_nodes(block_number);
+            // TODO: Self::cancel_expired_offchain_workers
+
             let emission_per_block = Self::get_total_emission_per_block();
             // Make sure to use storage layer,
             // so runtime can never panic in initialization hook
@@ -106,6 +169,17 @@ pub mod pallet {
             if let Err(err) = res {
                 log::error!("Error in on_initialize emission: {err:?}, skipping...");
             }
+
+            Self::copy_delegated_weights(block_number);
+            for netuid in pallet_subspace::N::<T>::iter_keys() {
+                if pallet_subspace::Pallet::<T>::blocks_until_next_epoch(netuid, block_number) > 0 {
+                    continue;
+                }
+
+                // Clear weights for normal subnets
+                Self::clear_set_weight_rate_limiter(netuid);
+            }
+
             Weight::zero()
         }
     }
@@ -140,11 +214,11 @@ pub mod pallet {
             <T as Config>::Currency::total_issuance().saturated_into()
         }
 
-    fn get_total_issuence_as_u64() -> u64
-    where
-        <<T as pallet::Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance:
-            TryInto<u64>,
-    {
+        fn get_total_issuence_as_u64() -> u64
+        where
+            <<T as pallet::Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance:
+                TryInto<u64>,
+        {
             let total_free_balance = Self::get_total_free_balance();
             let total_staked_balance = TotalStake::<T>::get();
             total_free_balance
@@ -158,7 +232,6 @@ pub mod pallet {
 
         // Halving occurs every 250 million minted tokens, until reaching a maximum supply of 1
         // billion tokens.
-        #[must_use]
         pub fn get_total_emission_per_block() -> u64 {
             let total_issuance = Self::get_total_issuence_as_u64();
             let unit_emission = UnitEmission::<T>::get();
@@ -204,10 +277,7 @@ pub mod pallet {
         // Emission Distribution per Subnet
         // =================================
 
-        // Returns emisison for every network
-        // TODO
-        // later
-        // change this to also have the governacne processes, of picking the right subnet pricing
+        /// Returns emisison for every subnet
         #[must_use]
         pub fn get_subnet_pricing(token_emission: u64) -> PricedSubnets {
             let rootnet_id = Self::get_consensus_netuid(SubnetConsensus::Root).unwrap_or(0);
@@ -225,6 +295,55 @@ pub mod pallet {
             }
 
             priced_subnets
+        }
+
+        pub fn handle_decrypted_weights(netuid: u16, weights: Vec<BlockWeights>) {
+            Self::do_handle_decrypted_weights(netuid, weights);
+        }
+
+        pub fn handle_authority_node_keep_alive(public_key: (Vec<u8>, Vec<u8>)) {
+            Self::do_handle_authority_node_keep_alive(public_key);
+        }
+    }
+
+    // TODO:
+    // add benchmarks
+    #[pallet::call]
+    impl<T: Config> Pallet<T> {
+        #[pallet::call_index(0)]
+        #[pallet::weight((0, DispatchClass::Normal, Pays::No))]
+        pub fn set_weights(
+            origin: OriginFor<T>,
+            netuid: u16,
+            uids: Vec<u16>,
+            weights: Vec<u16>,
+        ) -> DispatchResult {
+            Self::do_set_weights(origin, netuid, uids, weights)
+        }
+
+        #[pallet::call_index(1)]
+        #[pallet::weight((0, DispatchClass::Normal, Pays::No))]
+        pub fn set_weights_encrypted(
+            origin: OriginFor<T>,
+            netuid: u16,
+            encrypted_weights: Vec<u8>,
+            decrypted_weights_hash: Vec<u8>,
+        ) -> DispatchResult {
+            Self::do_set_weights_encrypted(
+                origin,
+                netuid,
+                encrypted_weights,
+                decrypted_weights_hash,
+            )
+        }
+
+        #[pallet::call_index(2)]
+        #[pallet::weight((0, DispatchClass::Normal, Pays::No))]
+        pub fn delegate_rootnet_control(
+            origin: OriginFor<T>,
+            target: T::AccountId,
+        ) -> DispatchResult {
+            Self::do_delegate_rootnet_control(origin, target)
         }
     }
 }

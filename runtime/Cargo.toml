@@ -13,10 +13,11 @@ repository = "https://github.com/commune-ai/subspace"
 targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-pallet-subspace = { path = "../pallets/subspace", default-features = false }
-pallet-governance = { path = "../pallets/governance", default-features = false }
 pallet-faucet = { path = "../pallets/faucet", optional = true, default-features = false }
+pallet-governance = { path = "../pallets/governance", default-features = false }
 pallet-subnet-emission = { path = "../pallets/subnet_emission", default-features = false }
+pallet-subspace = { path = "../pallets/subspace", default-features = false }
+pallet-offworker = { path = "../pallets/offworker", default-features = false }
 
 smallvec.workspace = true
 parity-scale-codec.workspace = true
@@ -93,7 +94,7 @@ std = [
     "frame-executive/std",
     "frame-support/std",
     "frame-system-rpc-runtime-api/std",
-    "frame-system/std",
+    "frame-system/std", 
     "frame-try-runtime/std",
     "pallet-subspace/std",
     "pallet-governance/std",
@@ -120,22 +121,20 @@ std = [
     "sp-transaction-pool/std",
     "sp-version/std",
     "substrate-wasm-builder",
-    "subspace-runtime-api/std",
-    # EVM
-    # Frontier
-    "fp-account/std",
-    "fp-evm/std",
-    "fp-rpc/std",
-    "fp-self-contained/std",
-    # Frontier FRAME
     "pallet-base-fee/std",
-    "pallet-dynamic-fee/std",
-    "pallet-ethereum/std",
-    "pallet-evm/std",
-    "pallet-evm-chain-id/std",
-    "pallet-evm-precompile-modexp/std",
-    "pallet-evm-precompile-sha3fips/std",
-    "pallet-evm-precompile-simple/std",
+    "subspace-runtime-api/std",
+	"fp-account/std",
+	"fp-evm/std",
+	"fp-rpc/std",
+	"fp-self-contained/std",
+	"pallet-base-fee/std",
+	"pallet-dynamic-fee/std",
+	"pallet-ethereum/std",
+	"pallet-evm/std",
+	"pallet-evm-chain-id/std",
+	"pallet-evm-precompile-modexp/std",
+	"pallet-evm-precompile-sha3fips/std",
+	"pallet-evm-precompile-simple/std",
 ]
 runtime-benchmarks = [
     "frame-benchmarking/runtime-benchmarks",
@@ -162,15 +161,11 @@ try-runtime = [
     "pallet-multisig/try-runtime",
     "pallet-governance/try-runtime",
     "pallet-subnet-emission/try-runtime",
+    "pallet-offworker/try-runtime",
     "pallet-faucet/try-runtime",
     "pallet-subspace/try-runtime",
     "pallet-sudo/try-runtime",
     "pallet-timestamp/try-runtime",
     "pallet-transaction-payment/try-runtime",
     "pallet-utility/try-runtime",
-    "pallet-dynamic-fee/try-runtime",
-    "pallet-ethereum/try-runtime",
-    "pallet-evm/try-runtime",
-    "pallet-evm-chain-id/try-runtime",
-    "fp-self-contained/try-runtime",
 ]

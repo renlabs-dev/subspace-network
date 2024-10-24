@@ -7,21 +7,13 @@
 #[cfg(feature = "std")]
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 
-// Standard library imports
-use core::marker::PhantomData;
-
-// Substrate standard library (for `no_std` environments)
-use sp_std::{collections::btree_set::BTreeSet, prelude::*};
-
-// External crate imports
-use smallvec::smallvec;
-
-// FRAME support modules
 use frame_support::{
     genesis_builder_helper::{build_state, get_preset},
     pallet_prelude::Get,
 };
 use sp_genesis_builder::PresetId;
+
+use sp_runtime::SaturatedConversion;
 
 // Consensus pallets
 use pallet_aura::MinimumPeriodTimesTwo;
@@ -50,10 +42,12 @@ use sp_api::impl_runtime_apis;
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 
 // Substrate core primitives
+use frame_support::pallet_prelude::PhantomData;
 use sp_core::{
     crypto::{ByteArray, KeyTypeId},
     OpaqueMetadata, H160, H256, U256,
 };
+use sp_std::{boxed::Box, collections::btree_set::BTreeSet, vec::Vec};
 
 // Substrate runtime primitives
 use sp_runtime::{
@@ -82,6 +76,8 @@ use fp_rpc::TransactionStatus;
 
 // Transaction payment pallet
 use pallet_transaction_payment::{ConstFeeMultiplier, FungibleAdapter, Multiplier};
+
+use smallvec::smallvec;
 
 // Re-exports from FRAME support
 pub use frame_support::{
@@ -169,7 +165,7 @@ pub mod opaque {
     }
 }
 
-pub type Migrations = pallet_subspace::migrations::v14::MigrateToV14<Runtime>;
+pub type Migrations = ();
 
 // To learn more about runtime versioning, see:
 // https://docs.substrate.io/main-docs/build/upgrade#runtime-versioning
@@ -191,6 +187,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 };
 
 /// This determines the average expected block time that we are targeting.
+///
 /// Blocks will be produced at a minimum duration defined by `SLOT_DURATION`.x
 /// `SLOT_DURATION` is picked up by `pallet_timestamp` which is in turn picked
 /// up by `pallet_aura` to implement `fn slot_duration()`.
@@ -423,6 +420,7 @@ impl pallet_subspace::Config for Runtime {
     type WeightInfo = pallet_subspace::weights::SubstrateWeight<Runtime>;
     type DefaultMinValidatorStake = ConstU64<50_000_000_000_000>;
     type EnforceWhitelist = ConstBool<true>;
+    type DefaultUseWeightsEncryption = ConstBool<true>;
 }
 
 impl pallet_governance::Config for Runtime {
@@ -432,19 +430,47 @@ impl pallet_governance::Config for Runtime {
     type WeightInfo = pallet_governance::weights::SubstrateWeight<Runtime>;
 }
 
-#[cfg(feature = "testnet-faucet")]
-impl pallet_faucet::Config for Runtime {
+impl pallet_offworker::Config for Runtime {
+    type AuthorityId = pallet_offworker::crypto::AuthId;
     type RuntimeEvent = RuntimeEvent;
-    type Currency = Balances;
+    type MaxEncryptionTime = ConstU64<20_880>; // Close to 2 days
+    type UnsignedPriority = ConstU64<100>;
+}
+
+impl frame_system::offchain::SigningTypes for Runtime {
+    type Public = <Signature as Verify>::Signer;
+    type Signature = Signature;
 }
 
 // Includes emission logic for the runtime
 impl pallet_subnet_emission::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type Currency = Balances;
-    type Decimals = ConstU8<9>; // The runtime has 9 token decimals
+    // The runtime has 9 token decimals
+    type Decimals = ConstU8<9>;
     type HalvingInterval = ConstU64<250_000_000>;
     type MaxSupply = ConstU64<1_000_000_000>;
+    type DecryptionNodeRotationInterval = ConstU64<5_000>;
+    type MaxAuthorities = ConstU32<100>;
+    // Represented in number of blocks, defines how long decryption node will be banned for.
+    // Ban presists even if ping are being sent.
+    // 10_800 is one day, assume 8 second block time
+    type OffchainWorkerBanDuration = ConstU64<10_800>;
+    // Number of failed pings before a node is banned, and it's operations are canceled.
+    // 20 represents 1_000 blocks
+    type MaxFailedPings = ConstU8<20>;
+    // After these many missed pings, node will be kept out of rotation, and it's signing avoided.
+    // Node won't be fully banned yet.
+    // 5 represents 250 blocks
+    type MissedPingsForInactivity = ConstU8<5>;
+    // Represented in number of blocks, defines how often node sends keep-alive ping
+    type PingInterval = ConstU64<50>;
+}
+
+#[cfg(feature = "testnet-faucet")]
+impl pallet_faucet::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
 }
 
 pub const WEIGHT_MILLISECS_PER_BLOCK: u64 = 2000;
@@ -569,6 +595,7 @@ construct_runtime!(
         SubspaceModule: pallet_subspace,
         GovernanceModule: pallet_governance,
         SubnetEmissionModule: pallet_subnet_emission,
+        Offworker: pallet_offworker,
 
         #[cfg(feature = "testnet-faucet")]
         FaucetModule: pallet_faucet,
@@ -1162,7 +1189,7 @@ impl_runtime_apis! {
         }
 
         fn preset_names() -> Vec<sp_genesis_builder::PresetId> {
-            vec![]
+            sp_std::vec![]
         }
     }
 }
@@ -1236,6 +1263,61 @@ impl pallet_subnet_emission_api::SubnetEmissionApi for Runtime {
     ) {
         pallet_subnet_emission::SubnetConsensusType::<Runtime>::set(netuid, subnet_consensus)
     }
+
+    fn get_weights(netuid: u16, uid: u16) -> Option<Vec<(u16, u16)>> {
+        pallet_subnet_emission::Weights::<Runtime>::get(netuid, uid)
+    }
+
+    /// returns the old weights if it's overwritten
+    fn set_weights(
+        netuid: u16,
+        uid: u16,
+        weights: Option<Vec<(u16, u16)>>,
+    ) -> Option<Vec<(u16, u16)>> {
+        let old_weights = pallet_subnet_emission::Weights::<Runtime>::get(netuid, uid);
+        pallet_subnet_emission::Weights::<Runtime>::set(netuid, uid, weights);
+        old_weights
+    }
+
+    /// returns the removed weights if any
+    fn remove_weights(netuid: u16, uid: u16) -> Option<Vec<(u16, u16)>> {
+        let old_weights = pallet_subnet_emission::Weights::<Runtime>::get(netuid, uid);
+        pallet_subnet_emission::Weights::<Runtime>::remove(netuid, uid);
+        old_weights
+    }
+
+    fn set_subnet_weights(
+        netuid: u16,
+        weights: Option<Vec<(u16, Vec<(u16, u16)>)>>,
+    ) -> Option<Vec<(u16, Vec<(u16, u16)>)>> {
+        let old_weights = pallet_subnet_emission::Weights::<Runtime>::iter_prefix(netuid)
+            .collect::<Vec<(_, Vec<_>)>>();
+        let _ =
+            pallet_subnet_emission::Weights::<Runtime>::clear_prefix(netuid, u16::MAX as u32, None);
+        if let Some(weights) = weights {
+            for (uid, weights) in weights.into_iter() {
+                pallet_subnet_emission::Weights::<Runtime>::insert(netuid, uid, weights);
+            }
+        }
+
+        if old_weights.is_empty() {
+            None
+        } else {
+            Some(old_weights)
+        }
+    }
+
+    fn clear_subnet_weights(netuid: u16) -> Option<Vec<(u16, Vec<(u16, u16)>)>> {
+        let old_weights = pallet_subnet_emission::Weights::<Runtime>::iter_prefix(netuid)
+            .collect::<Vec<(_, Vec<_>)>>();
+        let _ =
+            pallet_subnet_emission::Weights::<Runtime>::clear_prefix(netuid, u16::MAX as u32, None);
+        if old_weights.is_empty() {
+            None
+        } else {
+            Some(old_weights)
+        }
+    }
 }
 
 impl pallet_governance_api::GovernanceApi<<Runtime as frame_system::Config>::AccountId>
@@ -1304,6 +1386,65 @@ impl pallet_governance_api::GovernanceApi<<Runtime as frame_system::Config>::Acc
 
     fn set_general_subnet_application_cost(amount: u64) {
         GeneralSubnetApplicationCost::<Runtime>::put(amount)
+    }
+}
+
+impl<C> frame_system::offchain::SendTransactionTypes<C> for Runtime
+where
+    RuntimeCall: From<C>,
+{
+    type Extrinsic = UncheckedExtrinsic;
+    type OverarchingCall = RuntimeCall;
+}
+
+impl<LocalCall> frame_system::offchain::CreateSignedTransaction<LocalCall> for Runtime
+where
+    RuntimeCall: From<LocalCall>,
+{
+    fn create_transaction<C: frame_system::offchain::AppCrypto<Self::Public, Self::Signature>>(
+        call: Self::OverarchingCall,
+        public: Self::Public,
+        account: Self::AccountId,
+        nonce: Self::Nonce,
+    ) -> Option<(
+        Self::OverarchingCall,
+        <Self::Extrinsic as sp_runtime::traits::Extrinsic>::SignaturePayload,
+    )> {
+        use parity_scale_codec::Encode;
+        use sp_runtime::traits::StaticLookup;
+        // take the biggest period possible.
+        let period = BlockHashCount::get().checked_next_power_of_two().map(|c| c / 2).unwrap_or(2);
+
+        let current_block = System::block_number()
+            .saturated_into::<u64>()
+            // The `System::block_number` is initialized with `n+1`,
+            // so the actual block number is `n`.
+            .saturating_sub(1);
+        let tip = 0;
+        let extra: SignedExtra = (
+            frame_system::CheckNonZeroSender::<Runtime>::new(),
+            frame_system::CheckSpecVersion::<Runtime>::new(),
+            frame_system::CheckTxVersion::<Runtime>::new(),
+            frame_system::CheckGenesis::<Runtime>::new(),
+            frame_system::CheckMortality::<Runtime>::from(generic::Era::mortal(
+                period,
+                current_block,
+            )),
+            frame_system::CheckNonce::<Runtime>::from(nonce),
+            frame_system::CheckWeight::<Runtime>::new(),
+            pallet_transaction_payment::ChargeTransactionPayment::<Runtime>::from(tip),
+            // frame_metadata_hash_extension::CheckMetadataHash::new(true), TODO
+        );
+
+        let raw_payload = SignedPayload::new(call, extra)
+            .map_err(|_e| {
+                // TODO
+            })
+            .ok()?;
+        let signature = raw_payload.using_encoded(|payload| C::sign(payload, public))?;
+        let (call, extra, _) = raw_payload.deconstruct();
+        let address = <Runtime as frame_system::Config>::Lookup::unlookup(account);
+        Some((call, (address, signature, extra)))
     }
 }
 

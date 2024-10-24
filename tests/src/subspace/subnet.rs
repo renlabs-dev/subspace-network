@@ -5,6 +5,7 @@ use pallet_governance::{GovernanceConfiguration, SubnetGovernanceConfig, VoteMod
 use pallet_subspace::*;
 use sp_runtime::Percent;
 use subnet::SubnetChangeset;
+use substrate_fixed::types::I64F64;
 
 #[test]
 fn adds_and_removes_subnets() {
@@ -57,7 +58,6 @@ fn subnet_update_changes_all_parameter_values() {
             name: b"test".to_vec().try_into().unwrap(),
             metadata: Some(b"metadata".to_vec().try_into().unwrap()),
             tempo: 300,
-            trust_ratio: 11,
             maximum_set_weight_calls_per_epoch: 12,
             bonds_ma: 13,
             min_validator_stake: to_nano(50_000),
@@ -79,6 +79,8 @@ fn subnet_update_changes_all_parameter_values() {
                 adjustment_alpha: 28,
                 ..Default::default()
             },
+            use_weights_encryption: true,
+            copier_margin: I64F64::from_num(0),
         };
 
         let SubnetParams {
@@ -93,13 +95,14 @@ fn subnet_update_changes_all_parameter_values() {
             name,
             metadata,
             tempo,
-            trust_ratio,
             maximum_set_weight_calls_per_epoch,
             bonds_ma,
             module_burn_config,
             min_validator_stake,
             max_allowed_validators,
             governance_config,
+            use_weights_encryption,
+            copier_margin,
         } = params.clone();
 
         SubnetChangeset::<Test>::update(netuid, params).unwrap().apply(netuid).unwrap();
@@ -113,7 +116,6 @@ fn subnet_update_changes_all_parameter_values() {
         assert_eq!(MaxWeightAge::<Test>::get(netuid), max_weight_age);
         assert_eq!(SubnetNames::<Test>::get(netuid), name.into_inner());
         assert_eq!(Tempo::<Test>::get(netuid), tempo);
-        assert_eq!(TrustRatio::<Test>::get(netuid), trust_ratio);
         assert_eq!(
             MaximumSetWeightCallsPerEpoch::<Test>::get(netuid),
             Some(maximum_set_weight_calls_per_epoch)
@@ -135,6 +137,11 @@ fn subnet_update_changes_all_parameter_values() {
         assert_eq!(SubspaceMod::get_total_subnets(), 1);
         assert_eq!(N::<Test>::get(netuid), 1);
         assert_eq!(SubnetMetadata::<Test>::get(netuid), metadata);
+        assert_eq!(
+            UseWeightsEncryption::<Test>::get(netuid),
+            use_weights_encryption
+        );
+        assert_eq!(CopierMargin::<Test>::get(netuid), copier_margin);
     });
 }
 
@@ -158,7 +165,6 @@ fn removes_subnet_from_storage() {
                     max_weight_age,
                     name,
                     tempo,
-                    trust_ratio,
                     maximum_set_weight_calls_per_epoch: _,
                     bonds_ma,
                     min_validator_stake: _,
@@ -176,7 +182,6 @@ fn removes_subnet_from_storage() {
                 $m!(MaxWeightAge, max_weight_age);
                 $m!(SubnetNames, name);
                 $m!(Tempo, tempo);
-                $m!(TrustRatio, trust_ratio);
                 $m!(BondsMovingAverage, bonds_ma);
                 $m!(SubnetGovernanceConfig, governance_config);
                 $m!(N);
@@ -234,13 +239,14 @@ fn update_subnet_verifies_names_uniquiness_integrity() {
                 params.min_allowed_weights,
                 params.max_weight_age,
                 params.tempo,
-                params.trust_ratio,
                 params.maximum_set_weight_calls_per_epoch,
                 params.governance_config.vote_mode,
                 params.bonds_ma,
                 params.module_burn_config,
                 params.min_validator_stake,
                 params.max_allowed_validators,
+                params.use_weights_encryption,
+                params.copier_margin,
             )
         };
 

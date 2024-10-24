@@ -1,11 +1,10 @@
-use super::*;
+use crate::*;
 
 use frame_support::{
     pallet_prelude::DispatchResult, storage::IterableStorageMap, IterableStorageDoubleMap,
 };
 use pallet_subnet_emission_api::SubnetConsensus;
 
-use global::{BurnType, GeneralBurnConfiguration};
 use sp_runtime::{BoundedVec, DispatchError};
 use sp_std::vec::Vec;
 use substrate_fixed::types::I64F64;
@@ -41,7 +40,6 @@ impl<T: Config> SubnetChangeset<T> {
         MaxAllowedWeights::<T>::insert(netuid, self.params.max_allowed_weights);
         MaxWeightAge::<T>::insert(netuid, self.params.max_weight_age);
         MinAllowedWeights::<T>::insert(netuid, self.params.min_allowed_weights);
-        TrustRatio::<T>::insert(netuid, self.params.trust_ratio);
         IncentiveRatio::<T>::insert(netuid, self.params.incentive_ratio);
         BondsMovingAverage::<T>::insert(netuid, self.params.bonds_ma);
         self.params.module_burn_config.apply_module_burn(netuid)?;
@@ -61,6 +59,9 @@ impl<T: Config> SubnetChangeset<T> {
             SubnetMetadata::<T>::insert(netuid, metadata);
         }
         MaxAllowedValidators::<T>::insert(netuid, self.params.max_allowed_validators);
+        UseWeightsEncryption::<T>::insert(netuid, self.params.use_weights_encryption);
+        CopierMargin::<T>::insert(netuid, self.params.copier_margin);
+
         Pallet::<T>::deposit_event(Event::SubnetParamsUpdated(netuid));
 
         Ok(())
@@ -98,9 +99,6 @@ impl<T: Config> SubnetChangeset<T> {
             Error::<T>::InvalidMaxWeightAge
         );
 
-        // ensure the trust_ratio is between 0 and 100
-        ensure!(params.trust_ratio <= 100, Error::<T>::InvalidTrustRatio);
-
         ensure!(
             params.max_allowed_uids > 0,
             Error::<T>::InvalidMaxAllowedUids
@@ -133,6 +131,8 @@ impl<T: Config> SubnetChangeset<T> {
             params.min_validator_stake <= 250_000_000_000_000,
             Error::<T>::InvalidMinValidatorStake
         );
+
+        ensure!(params.copier_margin <= 1, Error::<T>::InvalidCopierMargin);
 
         if let Some(max_allowed_validators) = params.max_allowed_validators {
             ensure!(
@@ -171,7 +171,6 @@ impl<T: Config> Pallet<T> {
             max_weight_age: MaxWeightAge::<T>::get(netuid),
             min_allowed_weights: MinAllowedWeights::<T>::get(netuid),
             name: BoundedVec::truncate_from(SubnetNames::<T>::get(netuid)),
-            trust_ratio: TrustRatio::<T>::get(netuid),
             incentive_ratio: IncentiveRatio::<T>::get(netuid),
             maximum_set_weight_calls_per_epoch: MaximumSetWeightCallsPerEpoch::<T>::get(netuid)
                 .unwrap_or_default(),
@@ -183,6 +182,8 @@ impl<T: Config> Pallet<T> {
             max_allowed_validators: MaxAllowedValidators::<T>::get(netuid),
             governance_config: T::get_subnet_governance_configuration(netuid),
             metadata: SubnetMetadata::<T>::get(netuid),
+            use_weights_encryption: UseWeightsEncryption::<T>::get(netuid),
+            copier_margin: CopierMargin::<T>::get(netuid),
         }
     }
 
@@ -272,7 +273,7 @@ impl<T: Config> Pallet<T> {
         // --- 2. Remove consnesus vectors
         // ===============================
 
-        let _ = Weights::<T>::clear_prefix(netuid, u32::MAX, None);
+        let _ = T::clear_subnet_weights(netuid);
         let _ = WeightSetAt::<T>::clear_prefix(netuid, u32::MAX, None);
         Active::<T>::remove(netuid);
         Consensus::<T>::remove(netuid);
@@ -299,7 +300,6 @@ impl<T: Config> Pallet<T> {
         MaxAllowedUids::<T>::remove(netuid);
         MaxWeightAge::<T>::remove(netuid);
         MinAllowedWeights::<T>::remove(netuid);
-        TrustRatio::<T>::remove(netuid);
         IncentiveRatio::<T>::remove(netuid);
         MaximumSetWeightCallsPerEpoch::<T>::remove(netuid);
         BondsMovingAverage::<T>::remove(netuid);
@@ -415,7 +415,7 @@ impl<T: Config> Pallet<T> {
     pub fn get_key_for_uid(netuid: u16, module_uid: u16) -> Option<T::AccountId> {
         Keys::<T>::get(netuid, module_uid)
     }
-    /// Returns the uid of the key in the network as a Result. Ok if the key has a slot.
+    ///Returns the uid of the key in the network as a Result. Ok if the key has a slot.
     #[inline]
     pub fn get_uid_for_key(netuid: u16, key: &T::AccountId) -> Option<u16> {
         Uids::<T>::get(netuid, key)

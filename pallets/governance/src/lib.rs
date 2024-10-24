@@ -18,9 +18,14 @@ use frame_support::{
 };
 use frame_system::pallet_prelude::OriginFor;
 use sp_std::vec::Vec;
+use substrate_fixed::types::I64F64;
 
 pub use pallet::*;
 pub use pallet_governance_api::*;
+use pallet_subspace::{
+    self, network::subnet::SubnetChangeset, params::global::GeneralBurnConfiguration, DefaultKey,
+};
+
 pub use proposal::{Proposal, ProposalData, ProposalId, ProposalStatus, UnrewardedProposal};
 
 type SubnetId = u16;
@@ -37,7 +42,6 @@ pub mod pallet {
         PalletId,
     };
     use frame_system::pallet_prelude::{ensure_signed, BlockNumberFor};
-    use pallet_subspace::{global::GeneralBurnConfiguration, DefaultKey};
     use sp_runtime::traits::AccountIdConversion;
 
     const STORAGE_VERSION: StorageVersion = StorageVersion::new(3);
@@ -231,13 +235,14 @@ pub mod pallet {
             min_allowed_weights: u16,
             max_weight_age: u64,
             tempo: u16,
-            trust_ratio: u16,
             maximum_set_weight_calls_per_epoch: u16,
             vote_mode: VoteMode,
             bonds_ma: u64,
             module_burn_config: GeneralBurnConfiguration<T>,
             min_validator_stake: u64,
             max_allowed_validators: Option<u16>,
+            use_weights_encryption: bool,
+            copier_margin: I64F64,
         ) -> DispatchResult {
             let mut params = pallet_subspace::Pallet::subnet_params(netuid);
             params.founder = founder;
@@ -251,13 +256,14 @@ pub mod pallet {
             params.min_allowed_weights = min_allowed_weights;
             params.max_weight_age = max_weight_age;
             params.tempo = tempo;
-            params.trust_ratio = trust_ratio;
             params.maximum_set_weight_calls_per_epoch = maximum_set_weight_calls_per_epoch;
             params.governance_config.vote_mode = vote_mode;
             params.bonds_ma = bonds_ma;
             params.module_burn_config = module_burn_config;
             params.min_validator_stake = min_validator_stake;
             params.max_allowed_validators = max_allowed_validators;
+            params.use_weights_encryption = use_weights_encryption;
+            params.copier_margin = copier_margin;
             Self::do_add_subnet_params_proposal(origin, netuid, data, params)
         }
 

@@ -25,8 +25,4 @@ subspace-runtime-api = { path = "./runtime-api", default-features = false }
 
 [features]
 default = ["std"]
-std = [
-  "sp-api/std",
-  "sp-runtime/std",
-  "subspace-runtime-api/std",
-]
+std = ["sp-api/std", "sp-runtime/std", "subspace-runtime-api/std"]

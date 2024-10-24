@@ -1,4 +1,4 @@
-use super::*;
+use crate::*;
 
 use frame_support::pallet_prelude::DispatchResult;
 use sp_arithmetic::per_things::Percent;
@@ -269,8 +269,8 @@ impl<T: Config> Pallet<T> {
         WeightSetAt::<T>::remove(netuid, replace_uid);
 
         // SWAP WEIGHTS
-        Weights::<T>::insert(netuid, uid, Weights::<T>::get(netuid, replace_uid)); // Make uid - key association.
-        Weights::<T>::remove(netuid, replace_uid); // Make uid - key association.
+        let weights = T::remove_weights(netuid, replace_uid);
+        T::set_weights(netuid, uid, weights);
 
         // HANDLE THE REGISTRATION BLOCK
         RegistrationBlock::<T>::insert(

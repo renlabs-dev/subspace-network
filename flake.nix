@@ -44,8 +44,8 @@
             LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
             ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
             ZSTD_SYS_USE_PKG_CONFIG = "true";
-            OPENSSL_DIR = "${pkgs.openssl.dev}";   
-            OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib"; 
+            OPENSSL_DIR = "${pkgs.openssl.dev}";
+            OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
             OPENSSL_INCLUDE_DIR = "${pkgs.openssl.dev}/include"; 
           } // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux { JEMALLOC_OVERRIDE = "${pkgs.jemalloc}/lib/libjemalloc.so"; };
         };

@@ -1,9 +1,16 @@
 //! Service and ServiceFactory implementation. Specialized wrapper over substrate service.
 
-use std::{cell::RefCell, path::Path, sync::Arc, time::Duration};
+use std::{
+    cell::RefCell,
+    io::{Cursor, Read},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::{channel::mpsc, prelude::*};
 use prometheus_endpoint::Registry;
+use rsa::{pkcs1::DecodeRsaPrivateKey, traits::PublicKeyParts, Pkcs1v15Encrypt};
 use sc_client_api::{Backend, BlockBackend};
 use sc_consensus::BasicQueue;
 use sc_network_sync::strategy::warp::{WarpSyncParams, WarpSyncProvider};
@@ -235,6 +242,7 @@ pub async fn new_full<N>(
     mut config: Configuration,
     eth_config: EthConfiguration,
     sealing: Option<Sealing>,
+    rsa_key: Option<PathBuf>,
 ) -> Result<TaskManager, ServiceError>
 where
     N: sc_network::NetworkBackend<Block, <Block as BlockT>::Hash>,
@@ -322,7 +330,11 @@ where
                 )),
                 network_provider: Arc::new(network.clone()),
                 enable_http_requests: true,
-                custom_extensions: |_| vec![],
+                custom_extensions: move |_| {
+                    vec![Box::new(ow_extensions::OffworkerExt::new(Decrypter::new(
+                        rsa_key.clone(),
+                    ))) as Box<_>]
+                },
             })
             .run(client.clone(), task_manager.spawn_handle())
             .boxed(),
@@ -680,8 +692,9 @@ pub async fn build_full(
     config: Configuration,
     eth_config: EthConfiguration,
     sealing: Option<Sealing>,
+    rsa_key: Option<PathBuf>,
 ) -> Result<TaskManager, ServiceError> {
-    new_full::<sc_network::NetworkWorker<_, _>>(config, eth_config, sealing).await
+    new_full::<sc_network::NetworkWorker<_, _>>(config, eth_config, sealing, rsa_key).await
 }
 
 pub fn new_chain_ops(
@@ -707,4 +720,103 @@ pub fn new_chain_ops(
         ..
     } = new_partial(config, eth_config, build_aura_grandpa_import_queue)?;
     Ok((client, backend, import_queue, task_manager, other.3))
+}
+
+struct Decrypter {
+    key: Option<rsa::RsaPrivateKey>,
+}
+
+impl Decrypter {
+    fn new(rsa_key_path: Option<PathBuf>) -> Self {
+        let decryption_key_path = if let Some(rsa_key_path) = rsa_key_path {
+            rsa_key_path
+        } else {
+            Path::new("decryption.pem").to_path_buf()
+        };
+
+        if !decryption_key_path.exists() {
+            eprintln!("node does not have a decryption key configured");
+            return Self { key: None };
+        }
+
+        let Ok(content) = std::fs::read_to_string(decryption_key_path) else {
+            eprintln!("node does not have a decryption key configured");
+            return Self { key: None };
+        };
+
+        match rsa::RsaPrivateKey::from_pkcs1_pem(&content) {
+            Ok(key) => {
+                eprintln!("node started with decryption key configured");
+                Self { key: Some(key) }
+            }
+            Err(err) => {
+                eprintln!("failed to load decryption key for node: {err:?}");
+                Self { key: None }
+            }
+        }
+    }
+}
+
+impl ow_extensions::OffworkerExtension for Decrypter {
+    fn decrypt_weight(&self, encrypted: Vec<u8>) -> Option<(Vec<(u16, u16)>, Vec<u8>)> {
+        let Some(key) = &self.key else {
+            return None;
+        };
+
+        let vec = encrypted
+            .chunks(key.size())
+            .map(|chunk| match key.decrypt(Pkcs1v15Encrypt, chunk) {
+                Ok(decrypted) => Some(decrypted),
+                Err(_) => None,
+            })
+            .collect::<Option<Vec<Vec<u8>>>>()?;
+
+        let decrypted = vec.into_iter().flatten().collect::<Vec<_>>();
+
+        let mut res = Vec::new();
+
+        let mut cursor = Cursor::new(&decrypted);
+
+        let length = read_u32(&mut cursor)?;
+        for _ in 0..length {
+            let uid = read_u16(&mut cursor)?;
+            let weight = read_u16(&mut cursor)?;
+
+            res.push((uid, weight));
+        }
+
+        let mut key = Vec::new();
+        cursor.read_to_end(&mut key).ok()?;
+
+        Some((res, key))
+    }
+
+    fn is_decryption_node(&self) -> bool {
+        self.key.is_some()
+    }
+
+    fn get_encryption_key(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let Some(key) = &self.key else {
+            return None;
+        };
+
+        let public = rsa::RsaPublicKey::from(key);
+        Some((public.n().to_bytes_be(), public.e().to_bytes_le()))
+    }
+}
+
+fn read_u32(cursor: &mut Cursor<&Vec<u8>>) -> Option<u32> {
+    let mut buf: [u8; 4] = [0u8; 4];
+    match cursor.read_exact(&mut buf[..]) {
+        Ok(()) => Some(u32::from_be_bytes(buf)),
+        Err(_) => None,
+    }
+}
+
+fn read_u16(cursor: &mut Cursor<&Vec<u8>>) -> Option<u16> {
+    let mut buf = [0u8; 2];
+    match cursor.read_exact(&mut buf[..]) {
+        Ok(()) => Some(u16::from_be_bytes(buf)),
+        Err(_) => None,
+    }
 }

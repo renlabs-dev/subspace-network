@@ -1,15 +1,17 @@
 [workspace]
 members = [
     "node",
-    "pallets/subspace",
-    "pallets/subspace/genesis-config",
+    "pallets/faucet",
     "pallets/governance",
     "pallets/governance/api",
-    "pallets/faucet",
+    "pallets/offworker",
     "pallets/subnet_emission",
+    "pallets/subspace",
+    "pallets/subspace/genesis-config",
     "runtime",
-    "xtask",
     "tests",
+    "ow_extensions",
+    "xtask",
 ]
 resolver = "2"
 
@@ -30,15 +32,20 @@ match_bool = "deny"
 infinite_loop = "deny"
 
 [workspace.dependencies]
+tokio = "1.17.0"
+sha2 = "0.10.8"
+rsa = "0.9.4"
 async-trait = "0.1"
 # External dependencies
 bty = { version = "0.2.0", default-features = false }
+env_logger = "0.11.3"
 futures = "0.3.21"
 clap = "4.4.6"
 hex = "0.4.3"
 jsonrpsee = "0.22.2"
 log = { version = "0.4.21", default-features = false }
-tokio = "1.17.0"
+parity-util-mem = "0.11.0"
+rand = "0.8"
 serde = { version = "1.0.145", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0.108", default-features = false, features = [
     "alloc",
@@ -131,6 +138,7 @@ sc-service = { git = "https://github.com/paritytech/polkadot-sdk", branch = "rel
 sc-telemetry = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0" }
 sc-transaction-pool = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0" }
 sc-transaction-pool-api = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0" }
+sp-externalities = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
 sp-api = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
 sp-arithmetic = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
 sp-block-builder = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
@@ -142,9 +150,10 @@ sp-core = { git = "https://github.com/paritytech/polkadot-sdk", branch = "releas
 sp-genesis-builder = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
 sp-inherents = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
 sp-io = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
-sp-keyring = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0" }
+sp-keystore = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0" }
 sp-offchain = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
 sp-runtime = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
+sp-runtime-interface = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
 sp-session = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
 sp-std = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
 sp-storage = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0", default-features = false }
@@ -155,6 +164,3 @@ sp-version = { git = "https://github.com/paritytech/polkadot-sdk", branch = "rel
 substrate-build-script-utils = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0" }
 substrate-frame-rpc-system = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0" }
 substrate-wasm-builder = { git = "https://github.com/paritytech/polkadot-sdk", branch = "release-polkadot-v1.11.0" }
-
-[patch."https://github.com/paritytech/polkadot-sdk"]
-sc-rpc-server = { git = "https://github.com/Supremesource/polkadot-sdk", branch = "release-polkadot-v1.11.0" }

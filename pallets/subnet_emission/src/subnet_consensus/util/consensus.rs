@@ -815,7 +815,7 @@ impl<T: Config> ConsensusOutput<T> {
 
         for (module_key, emitted_to) in self.emission_map {
             for (account_key, emission) in emitted_to {
-                if PalletSubspace::<T>::is_registered(Some(subnet_id), &account_key.0) {
+                if PalletSubspace::<T>::is_registered(Some(subnet_id), &module_key.0) {
                     PalletSubspace::<T>::increase_stake(&account_key.0, &module_key.0, emission);
                 } else {
                     PalletSubspace::<T>::add_balance_to_account(&account_key.0, emission);
